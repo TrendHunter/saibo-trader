@@ -31,7 +31,7 @@ Polymarket **5m / 15m Up-Down** 市场（BTC / ETH / SOL）自动交易。主策
 
 **Leg1 模式**：`LIH_LEG1_MODE=cheap`（本仓库 VPS 默认）。顺势买贵腿见 [`saibo-trader-trend`](https://github.com/TrendHunter/saibo-trader-trend) 或本地设 `LIH_LEG1_MODE=trend`（详见 [`README_TREND.md`](README_TREND.md)）。
 
-**版本留档**：见 [`docs/LIH_VERSION.md`](docs/LIH_VERSION.md)（当前 `v0.10.0-endgame`）。
+**版本留档**：见 [`docs/LIH_VERSION.md`](docs/LIH_VERSION.md)（当前 `v0.11.0-dual-mode`）。
 
 ### Leg1 / 对冲锁（不留尾巴）
 
