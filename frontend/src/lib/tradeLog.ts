@@ -78,22 +78,24 @@ export function parseTradeRow(line: string): ParsedTradeRow {
   return { kind, label, color, summary: label, detail: line };
 }
 
-/** Drop duplicate CLOSED/HEDGE telemetry lines (same round logged twice). */
+/** Drop duplicate CLOSED/LEG1 per round; keep distinct HEDGE legs. */
 export function dedupeTradeTelemetry(lines: string[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const line of lines) {
-    const idMatch = line.match(/LIH-[a-z]+-\d+(?:-recon)?/i);
+    const idMatch = line.match(/LIH-([a-z]+)-(\d+)(?:-recon)?/i);
     let key = line.replace(/\s+/g, " ").trim();
     if (idMatch) {
-      const action = line.includes("CLOSED")
-        ? "CLOSED"
-        : line.includes("HEDGE")
-          ? "HEDGE"
-          : line.includes("LEG1")
-            ? "LEG1"
-            : "OTHER";
-      key = `${action}:${idMatch[0]}`;
+      const baseId = `LIH-${idMatch[1]}-${idMatch[2]}`;
+      const upper = line.toUpperCase();
+      if (upper.includes("CLOSED") || upper.includes("SETTLE")) {
+        key = `CLOSED:${baseId}`;
+      } else if (upper.includes("LEG1")) {
+        key = `LEG1:${baseId}`;
+      } else if (upper.includes("HEDGE")) {
+        const sh = line.match(/\+(\d+(?:\.\d+)?)\s*sh/i);
+        key = `HEDGE:${baseId}:${sh?.[1] ?? line}`;
+      }
     }
     if (seen.has(key)) continue;
     seen.add(key);

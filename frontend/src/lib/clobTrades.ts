@@ -62,7 +62,17 @@ export function mergeTradeHistory(
     (r) => r.strategy === "LIH" && r.status === "closed" && r.exitReason !== "CLOB_FILL"
   );
   if (hasLihClosed) {
-    const sorted = [...filteredBot].filter((r) => r.exitReason !== "CLOB_FILL");
+    const seen = new Set<string>();
+    const sorted = [...filteredBot].filter((r) => {
+      if (r.exitReason === "CLOB_FILL") return false;
+      if (r.strategy === "LIH" && r.status === "closed") {
+        const m = r.id.match(/^LIH-([a-z]+)-(\d+)/i);
+        const key = m ? `LIH-${m[1]}-${m[2]}` : r.id;
+        if (seen.has(key)) return false;
+        seen.add(key);
+      }
+      return true;
+    });
     sorted.sort((a, b) => {
       const ta = a.closedAt || a.openedAt || 0;
       const tb = b.closedAt || b.openedAt || 0;

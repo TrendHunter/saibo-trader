@@ -1515,8 +1515,9 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
         }
         double shares = resize_for_ask_book(book, act.shares);
         if (shares + kFloatTol < act.shares) {
-            spdlog::info("[LIVE LIH] LEG1 {} — book resize {:.2f} -> {:.2f} sh",
-                         act.market.asset, act.shares, shares);
+            spdlog::info("[LIVE LIH] LEG1 skip {} — book depth {:.2f} < {:.2f} sh required",
+                         act.market.asset, shares, act.shares);
+            return false;
         }
         if (!leg_meets_minimum(exec_px, shares)) {
             spdlog::warn("[LIVE LIH] LEG1 {} — depth/min not met for {:.2f} sh @ {:.4f}",
@@ -1571,8 +1572,10 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
             return false;
         }
         if (fill.size_shares + kFloatTol < shares) {
-            spdlog::warn("[LIVE LIH] LEG1 partial {:.2f}/{:.2f} {} — accepting fill",
+            risk_manager_.end_lih_leg1_inflight(act.market.asset, act.market.window_minutes);
+            spdlog::warn("[LIVE LIH] LEG1 partial {:.2f}/{:.2f} {} — rejected (no register)",
                          fill.size_shares, shares, act.market.asset);
+            return false;
         }
         drop_lih_pending_for(act);
         risk_manager_.register_lih_open_leg1(
@@ -1620,9 +1623,14 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
 
         double shares = resize_for_ask_book(book, act.shares);
         if (shares + kFloatTol < act.shares) {
-            spdlog::warn("[LIVE LIH] {} {} — need {:.2f} sh, book only {:.2f}",
+            spdlog::info("[LIVE LIH] {} {} — book resize {:.2f} -> {:.2f} sh",
                          act.kind == LegInAction::Kind::HeavyDilute ? "DILUTE" : "HEDGE",
                          act.market.asset, act.shares, shares);
+        }
+        if (shares < kMinFillShares) {
+            spdlog::warn("[LIVE LIH] {} {} — depth not met for {:.2f} sh",
+                         act.kind == LegInAction::Kind::HeavyDilute ? "DILUTE" : "HEDGE",
+                         act.market.asset, shares);
             return false;
         }
         if (!leg_meets_minimum(exec_px, shares)) return false;

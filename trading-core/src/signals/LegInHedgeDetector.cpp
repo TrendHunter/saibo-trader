@@ -11,6 +11,8 @@ constexpr double kLegMinUsdc = 1.0;
 constexpr double kFloatTol = 1e-6;
 constexpr double kStatusLogIntervalSec = 30.0;
 constexpr double kBalanceReserve = 0.995;
+/** YES/NO within this gap = balanced; skip one-sided hedge (paired scale/dilute only). */
+constexpr double kLihBalancedGapShares = 0.5;
 } // namespace
 
 LegInHedgeDetector::LegInHedgeDetector(StateStore& store,
@@ -405,7 +407,7 @@ std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::Ris
         const double gap = std::abs(pos.yes_shares - pos.no_shares);
         const double port_avg = (yes_avg > kFloatTol && no_avg > kFloatTol) ? yes_avg + no_avg : 0.0;
 
-        if (gap > kFloatTol) {
+        if (gap > kLihBalancedGapShares) {
             const bool in_endgame = secs_left <= endgame_secs_;
             const bool endgame_override = in_endgame && secs_left <= endgame_override_secs_;
             const double rebal_cd = endgame_override
@@ -431,7 +433,6 @@ std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::Ris
             const double heavy_ask = heavy_yes ? hq.yes : hq.no;
             const double light_ask = need_yes ? hq.yes : hq.no;
             const auto& light_token = need_yes ? market.yes_token_id : market.no_token_id;
-            const auto& heavy_token = heavy_yes ? market.yes_token_id : market.no_token_id;
 
             if (heavy_avg <= kFloatTol || light_ask <= kFloatTol) continue;
 
@@ -510,33 +511,7 @@ std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::Ris
                     if (auto act = try_light_hedge(budget_step, force, mode)) return act;
                     continue;
                 }
-                if (matched > kFloatTol &&
-                    heavy_ask + kFloatTol < heavy_avg * flex_dilute_ratio_ &&
-                    heavy_ask <= leg1_max_price_ + kFloatTol) {
-                    double fill = cap_shares_budget(leg1_shares_, max_leg_usdc, heavy_ask);
-                    if (store_.paper_depth_sim()) {
-                        fill = store_.walk_ask_fill(heavy_token, fill).shares;
-                    }
-                    if (fill * heavy_ask + kFloatTol >= kLegMinUsdc) {
-                        const double cost = fill * heavy_ask;
-                        if (rm.can_open_lih_leg(cost, true, &pos.lih_id, 0.0).first) {
-                            const double new_avg = heavy_yes
-                                ? (pos.yes_cost + fill * heavy_ask) / (pos.yes_shares + fill)
-                                : (pos.no_cost + fill * heavy_ask) / (pos.no_shares + fill);
-                            LegInAction act;
-                            act.kind = LegInAction::Kind::HeavyDilute;
-                            act.market = market;
-                            act.buy_yes = heavy_yes;
-                            act.price = heavy_ask;
-                            act.shares = fill;
-                            act.lih_id = pos.lih_id;
-                            act.note = fmt::format("heavy-dilute +{:.1f} {:.4f}->{:.4f} marg {:.4f}->{:.4f}",
-                                                   fill, heavy_avg, new_avg, marginal, new_avg + light_ask);
-                            last_rebalance_time_[key] = now_sec;
-                            return act;
-                        }
-                    }
-                }
+                // Mid-window flex: light-leg hedge only when sum≤target (README 利润对冲).
                 if (matched > kFloatTol && budget_step > kFloatTol) {
                     if (auto act = try_light_hedge(budget_step, false, "flex-hedge")) return act;
                 }
@@ -548,56 +523,8 @@ std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::Ris
             continue;
         }
 
-        if (matched <= kFloatTol) continue;
-
-        if (rebalance_cooldown_seconds_ > 0.0 &&
-            last_rebalance_time_.contains(key) &&
-            (now_sec - last_rebalance_time_.at(key)) < rebalance_cooldown_seconds_) {
-            continue;
-        }
-
-        if (rm.lih_rebalance_inflight(pos.lih_id)) continue;
-
-        if (remaining_matched <= kFloatTol) continue;
-
-        if (port_avg > target_combined_ + kFloatTol &&
-            (q.yes + q.no) <= target_combined_ + kFloatTol) {
-            const double fill = paired_fill_shares(
-                market, q.yes, q.no, max_leg_usdc, remaining_matched);
-            if (fill <= kFloatTol) continue;
-            const double cost = fill * (q.yes + q.no);
-            if (!rm.can_open_lih_leg(cost, true, &pos.lih_id, fill).first) continue;
-
-            const double new_yes = (pos.yes_cost + fill * q.yes) / (pos.yes_shares + fill);
-            const double new_no = (pos.no_cost + fill * q.no) / (pos.no_shares + fill);
-            LegInAction act;
-            act.kind = LegInAction::Kind::DilutePaired;
-            act.market = market;
-            act.price = q.yes + q.no;
-            act.shares = fill;
-            act.lih_id = pos.lih_id;
-            act.note = fmt::format("dilute +{:.1f} {:.4f}->{:.4f}", fill, port_avg, new_yes + new_no);
-            last_rebalance_time_[key] = now_sec;
-            return act;
-        }
-
-        if ((q.yes + q.no) <= target_combined_ + kFloatTol) {
-            const double fill = paired_fill_shares(
-                market, q.yes, q.no, max_leg_usdc, remaining_matched);
-            if (fill <= kFloatTol) continue;
-            const double cost = fill * (q.yes + q.no);
-            if (!rm.can_open_lih_leg(cost, true, &pos.lih_id, fill).first) continue;
-
-            LegInAction act;
-            act.kind = LegInAction::Kind::ScalePaired;
-            act.market = market;
-            act.price = q.yes + q.no;
-            act.shares = fill;
-            act.lih_id = pos.lih_id;
-            act.note = fmt::format("scale +{:.1f} sum {:.4f}", fill, q.yes + q.no);
-            last_rebalance_time_[key] = now_sec;
-            return act;
-        }
+        // Paired scale/dilute removed from mid-window — 压成本仅在末段有 gap 时通过
+        // endgame try_light_hedge + 软顶完成，不在平时对已配平仓位双边加仓。
     }
     return std::nullopt;
 }

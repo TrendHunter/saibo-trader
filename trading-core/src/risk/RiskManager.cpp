@@ -853,6 +853,12 @@ char lih_dominant_side(const LegInHedgePosition& p) {
     return ' ';
 }
 
+std::string lih_asset_key(const std::string& asset) {
+    std::string a = asset;
+    std::transform(a.begin(), a.end(), a.begin(), ::tolower);
+    return a;
+}
+
 bool lih_should_pair_closed(const LegInHedgePosition& a, const LegInHedgePosition& b) {
     const char sa = lih_dominant_side(a);
     const char sb = lih_dominant_side(b);
@@ -869,12 +875,6 @@ bool lih_should_pair_closed(const LegInHedgePosition& a, const LegInHedgePositio
     if ((sa == 'Y' || sa == 'N') && sb == 'B') return true;
     if ((sb == 'Y' || sb == 'N') && sa == 'B') return true;
     return false;
-}
-
-std::string lih_asset_key(const std::string& asset) {
-    std::string a = asset;
-    std::transform(a.begin(), a.end(), a.begin(), ::tolower);
-    return a;
 }
 
 std::string lih_pick_merged_id(const LegInHedgePosition& a, const LegInHedgePosition& b) {
