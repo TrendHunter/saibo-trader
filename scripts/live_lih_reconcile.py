@@ -450,6 +450,14 @@ def main() -> int:
     if args.merge:
         _drop_stale_recon(open_lih, fresh_ids)
 
+    # Drop expired windows so reconcile cannot resurrect settled rounds as open.
+    for lid in list(open_lih.keys()):
+        pos = open_lih[lid]
+        end = float(pos.get("end_date_ts") or 0)
+        if end > 0 and now > end + 5:
+            print(f"prune expired open {lid} (ended {end:.0f})")
+            del open_lih[lid]
+
     positions = fetch_user_positions(limit=500)
     if positions and isinstance(positions[0], dict) and positions[0].get("error"):
         print("WARN positions:", positions[0]["error"], file=sys.stderr)

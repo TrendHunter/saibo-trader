@@ -468,7 +468,8 @@ void check_and_close_lih_positions(
     risk::RiskManager& risk_manager,
     StateStore& store,
     GammaClient& gamma,
-    bool auto_redeem_enabled) {
+    bool auto_redeem_enabled,
+    const std::string* live_state_path = nullptr) {
     const double now = std::chrono::duration<double>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     auto open = risk_manager.get_open_lih_positions();
@@ -502,16 +503,22 @@ void check_and_close_lih_positions(
         if (fully_hedged) {
             const double proceeds = matched * 1.0;
             const double cost = p.yes_cost + p.no_cost;
-            risk_manager.register_lih_close(id, ey, en, "Market resolved (hedged)", now);
-            store.push_telemetry(fmt::format("[LIH] SETTLE {} | hedged {:.2f} sh | ~${:.2f} | YES={:.0f} NO={:.0f}",
-                p.asset, matched, proceeds - cost, ey, en));
+            if (risk_manager.register_lih_close(id, ey, en, "Market resolved (hedged)", now)) {
+                store.push_telemetry(fmt::format(
+                    "[LIH LIVE] CLOSED {} | {} hedged {:.2f}sh | PnL ~${:+.2f} | YES={:.0f} NO={:.0f}",
+                    id, p.asset, matched, proceeds - cost, ey, en));
+                if (live_state_path && !live_state_path->empty()) {
+                    persistence::save_live_lih_state(risk_manager, *live_state_path, false);
+                }
+            }
         } else {
-            const char* held = p.yes_shares > p.no_shares + 1e-6 ? "YES"
-                             : p.no_shares > p.yes_shares + 1e-6 ? "NO" : "?";
             risk_manager.register_lih_close(id, ey, en, "Market resolved (unhedged)", now);
             store.push_telemetry(fmt::format(
-                "[LIH] SETTLE {} | UNHEDGED held {} | yes={:.2f} no={:.2f} | YES={:.0f} NO={:.0f}",
-                p.asset, held, p.yes_shares, p.no_shares, ey, en));
+                "[LIH LIVE] CLOSED {} | {} UNHEDGED | yes={:.2f} no={:.2f} | YES={:.0f} NO={:.0f}",
+                id, p.asset, p.yes_shares, p.no_shares, ey, en));
+            if (live_state_path && !live_state_path->empty()) {
+                persistence::save_live_lih_state(risk_manager, *live_state_path, false);
+            }
         }
         if (is_live && auto_redeem_enabled && !condition_id.empty()) {
             attempt_onchain_redeem_async(condition_id, id, p.is_neg_risk, store, risk_manager);
@@ -1682,7 +1689,10 @@ int main() {
                     }
                 }
                 risk_manager.scrub_lih_inflight_locks(now_sec_loop);
-                check_and_close_lih_positions(risk_manager, store, gamma, auto_redeem);
+                check_and_close_lih_positions(
+                    risk_manager, store, gamma, auto_redeem,
+                    (lih_enabled && live_state_persist && !live_lih_dry_run && !paper_mode)
+                        ? &live_state_path : nullptr);
                 try_lih_evaluate(); // 主循环也跑 LIH（不依赖 tick）
             }
             if (lih_enabled && live_state_persist && !live_lih_dry_run && !paper_mode

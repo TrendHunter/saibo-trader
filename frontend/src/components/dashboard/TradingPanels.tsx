@@ -10,7 +10,7 @@ import {
   strategyShortLabel,
 } from "@/lib/strategyMode";
 import { Briefcase, Radio, Zap, Clock, TrendingUp, TrendingDown } from "lucide-react";
-import { classifyTradeLog } from "@/lib/tradeLog";
+import { classifyTradeLog, dedupeTradeTelemetry } from "@/lib/tradeLog";
 
 function logStyle(line: string) {
   const { color, label } = classifyTradeLog(line);
@@ -258,18 +258,20 @@ export function TradingPanels({ liveState }: { liveState: LiveState }) {
               交易流水
             </CardTitle>
           </CardHeader>
-          <CardContent>
+            <CardContent>
             <FeedList
-              lines={liveState.telemetryLog.filter(
-                (l) =>
-                  l.includes("PLACED") ||
-                  l.includes("SETTLED") ||
-                  l.includes("CLOSED") ||
-                  l.includes("FILLED") ||
-                  l.includes("OPENED") ||
-                  l.includes("BALANCE") ||
-                  l.includes("pending") ||
-                  l.includes("awaiting")
+              lines={dedupeTradeTelemetry(
+                liveState.telemetryLog.filter(
+                  (l) =>
+                    l.includes("PLACED") ||
+                    l.includes("SETTLED") ||
+                    l.includes("CLOSED") ||
+                    l.includes("FILLED") ||
+                    l.includes("OPENED") ||
+                    l.includes("BALANCE") ||
+                    l.includes("pending") ||
+                    l.includes("awaiting")
+                )
               )}
               emptyText="等待成交记录..."
             />

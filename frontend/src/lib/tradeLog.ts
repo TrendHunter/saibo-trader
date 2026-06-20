@@ -77,3 +77,27 @@ export function parseTradeRow(line: string): ParsedTradeRow {
 
   return { kind, label, color, summary: label, detail: line };
 }
+
+/** Drop duplicate CLOSED/HEDGE telemetry lines (same round logged twice). */
+export function dedupeTradeTelemetry(lines: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const line of lines) {
+    const idMatch = line.match(/LIH-[a-z]+-\d+(?:-recon)?/i);
+    let key = line.replace(/\s+/g, " ").trim();
+    if (idMatch) {
+      const action = line.includes("CLOSED")
+        ? "CLOSED"
+        : line.includes("HEDGE")
+          ? "HEDGE"
+          : line.includes("LEG1")
+            ? "LEG1"
+            : "OTHER";
+      key = `${action}:${idMatch[0]}`;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(line);
+  }
+  return out;
+}

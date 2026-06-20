@@ -857,6 +857,13 @@ bool lih_should_pair_closed(const LegInHedgePosition& a, const LegInHedgePositio
     const char sa = lih_dominant_side(a);
     const char sb = lih_dominant_side(b);
     if (sa == ' ' || sb == ' ') return false;
+    if (lih_asset_key(a.asset) != lih_asset_key(b.asset)) return false;
+    if (a.window_minutes != b.window_minutes) return false;
+    // Duplicate close rows (same round, different lih_id e.g. -recon).
+    if (sa == 'B' && sb == 'B' && a.end_date_ts > 0 && b.end_date_ts > 0 &&
+        std::abs(a.end_date_ts - b.end_date_ts) < 2.0) {
+        return true;
+    }
     if (sa != sb && sa != 'B' && sb != 'B') return true;
     // Orphan YES/NO leg + row that already has both sides (split -recon history).
     if ((sa == 'Y' || sa == 'N') && sb == 'B') return true;
@@ -896,6 +903,31 @@ LegInHedgePosition merge_closed_lih_pair(const LegInHedgePosition& a, const LegI
     out.no_shares = a.no_shares + b.no_shares;
     out.yes_cost = a.yes_cost + b.yes_cost;
     out.no_cost = a.no_cost + b.no_cost;
+    // Duplicate full hedge rows: same round closed twice — keep larger leg, not sum.
+    if (lih_dominant_side(a) == 'B' && lih_dominant_side(b) == 'B') {
+        out.yes_shares = std::max(a.yes_shares, b.yes_shares);
+        out.no_shares = std::max(a.no_shares, b.no_shares);
+        out.yes_cost = a.yes_shares >= b.yes_shares ? a.yes_cost : b.yes_cost;
+        out.no_cost = a.no_shares >= b.no_shares ? a.no_cost : b.no_cost;
+        if (a.yes_shares > b.yes_shares + kLihConsolidateTol) {
+            out.yes_entry_price = a.yes_entry_price > 0 ? a.yes_entry_price
+                : (a.yes_shares > kLihConsolidateTol ? a.yes_cost / a.yes_shares : 0.0);
+        } else if (b.yes_shares > a.yes_shares + kLihConsolidateTol) {
+            out.yes_entry_price = b.yes_entry_price > 0 ? b.yes_entry_price
+                : (b.yes_shares > kLihConsolidateTol ? b.yes_cost / b.yes_shares : 0.0);
+        }
+        if (a.no_shares > b.no_shares + kLihConsolidateTol) {
+            out.no_entry_price = a.no_entry_price > 0 ? a.no_entry_price
+                : (a.no_shares > kLihConsolidateTol ? a.no_cost / a.no_shares : 0.0);
+        } else if (b.no_shares > a.no_shares + kLihConsolidateTol) {
+            out.no_entry_price = b.no_entry_price > 0 ? b.no_entry_price
+                : (b.no_shares > kLihConsolidateTol ? b.no_cost / b.no_shares : 0.0);
+        }
+        out.pnl_usdc = a.pnl_usdc.value_or(0.0);
+        if (b.pnl_usdc.has_value()) out.pnl_usdc = b.pnl_usdc.value();
+        out.entry_fees = std::max(a.entry_fees, b.entry_fees);
+        out.rebalance_count = std::max(a.rebalance_count, b.rebalance_count);
+    }
     if (a.yes_shares > kLihConsolidateTol && a.yes_entry_price > 0) {
         out.yes_entry_price = a.yes_entry_price;
     } else if (b.yes_shares > kLihConsolidateTol && b.yes_entry_price > 0) {
@@ -910,19 +942,26 @@ LegInHedgePosition merge_closed_lih_pair(const LegInHedgePosition& a, const LegI
     } else if (out.no_shares > kLihConsolidateTol) {
         out.no_entry_price = out.no_cost / out.no_shares;
     }
-    out.entry_fees = a.entry_fees + b.entry_fees;
+    const bool both_dup = lih_dominant_side(a) == 'B' && lih_dominant_side(b) == 'B';
+    if (!both_dup) {
+        out.entry_fees = a.entry_fees + b.entry_fees;
+        out.rebalance_count = a.rebalance_count + b.rebalance_count;
+    }
     out.opened_at = std::min(a.opened_at, b.opened_at);
     out.end_date_ts = leg1.end_date_ts > 0 ? leg1.end_date_ts : leg2.end_date_ts;
     out.is_neg_risk = leg1.is_neg_risk || leg2.is_neg_risk;
     out.paper_mode = leg1.paper_mode || leg2.paper_mode;
     out.is_shadow = false;
-    out.rebalance_count = a.rebalance_count + b.rebalance_count;
     if (a.yes_shares > kLihConsolidateTol) out.yes_exit_price = a.yes_exit_price;
     else if (b.yes_shares > kLihConsolidateTol) out.yes_exit_price = b.yes_exit_price;
     if (a.no_shares > kLihConsolidateTol) out.no_exit_price = a.no_exit_price;
     else if (b.no_shares > kLihConsolidateTol) out.no_exit_price = b.no_exit_price;
     out.closed_at = std::max(a.closed_at.value_or(0.0), b.closed_at.value_or(0.0));
-    out.pnl_usdc = a.pnl_usdc.value_or(0.0) + b.pnl_usdc.value_or(0.0);
+    if (both_dup) {
+        out.pnl_usdc = leg2.pnl_usdc.value_or(leg1.pnl_usdc.value_or(0.0));
+    } else {
+        out.pnl_usdc = a.pnl_usdc.value_or(0.0) + b.pnl_usdc.value_or(0.0);
+    }
     out.exit_reason = leg2.exit_reason.empty() ? leg1.exit_reason : leg1.exit_reason;
     if (out.exit_reason.find("hedged") == std::string::npos &&
         (leg1.exit_reason.find("hedged") != std::string::npos ||
@@ -961,7 +1000,11 @@ void RiskManager::consolidate_closed_lih_positions() {
                 if (lih_asset_key(other.asset) != lih_asset_key(cur.asset)) continue;
                 if (other.window_minutes != cur.window_minutes) continue;
                 if (!lih_should_pair_closed(cur, other)) continue;
-                const double dt = std::abs(cur.opened_at - other.opened_at);
+                double dt = std::abs(cur.opened_at - other.opened_at);
+                if (cur.end_date_ts > 0 && other.end_date_ts > 0 &&
+                    lih_dominant_side(cur) == 'B' && lih_dominant_side(other) == 'B') {
+                    dt = std::abs(cur.end_date_ts - other.end_date_ts);
+                }
                 if (dt <= kLihPairSec && dt < best_dt) {
                     best_dt = dt;
                     best_j = static_cast<int>(j);
@@ -1249,6 +1292,12 @@ std::optional<LegInHedgePosition> RiskManager::register_lih_close(
     const std::string& exit_reason,
     std::optional<double> exit_timestamp) {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
+    for (const auto& closed : closed_lih_positions_) {
+        if (closed.lih_id == lih_id) {
+            spdlog::debug("[LIH] close skip {} — already in closed history", lih_id);
+            return std::nullopt;
+        }
+    }
     auto it = open_lih_positions_.find(lih_id);
     if (it == open_lih_positions_.end()) return std::nullopt;
 
@@ -1959,11 +2008,16 @@ bool RiskManager::import_live_lih_state(const boost::json::object& doc) {
         if (doc.contains("lih_pnl")) lih_pnl_ = doc.at("lih_pnl").as_double();
 
         open_lih_positions_.clear();
+        const double now_sec = now();
         if (doc.contains("open_lih_positions") && doc.at("open_lih_positions").is_object()) {
             for (const auto& kv : doc.at("open_lih_positions").as_object()) {
                 LegInHedgePosition p;
                 if (lih_position_from_json(kv.value().as_object(), p)) {
                     if (p.paper_mode || p.is_shadow) continue;
+                    if (p.end_date_ts > 0 && now_sec > p.end_date_ts + 5.0) {
+                        spdlog::debug("import_live_lih_state: skip expired open {}", p.lih_id);
+                        continue;
+                    }
                     open_lih_positions_[p.lih_id] = p;
                 }
             }
