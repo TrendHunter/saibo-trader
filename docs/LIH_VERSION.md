@@ -20,7 +20,7 @@ Git 以 commit hash 为准；语义版本便于口头对齐。
 
 - **`LIH_LEG1_MODE=cheap`**（主仓库 / VPS）：买 ask ≤ `LIH_LEG1_MAX_PRICE`（0.45）+ 可选 `LIH_LEG1_TREND_ALIGN`。
 - **`LIH_LEG1_MODE=trend`**（[`saibo-trader-trend`](https://github.com/TrendHunter/saibo-trader-trend)）：Binance 顺势买贵腿，ask ≤ `LIH_LEG1_TREND_MAX_PRICE`（0.65）。
-- **开局延迟** `LIH_LEG1_START_DELAY_SEC=7`：窗口开盘后前 7s 不买 leg1（非强制入场）。
+- **开局延迟** `LIH_LEG1_START_DELAY_SEC=5`：窗口开盘后前 5s 不买 leg1（非强制入场）。
 - **目标合价** `LIH_TARGET_COMBINED=0.94`。
 - **末段起点** `LIH_ENDGAME_SECS=100`（T≤100s 进入 endgame，替代旧 60s）。
 - **Override** `LIH_ENDGAME_OVERRIDE_SECS=50`：最后 50s 可突破软顶 1.15。
@@ -45,7 +45,7 @@ LIH_LEG1_MODE=cheap
 LIH_LEG1_MAX_PRICE=0.45
 LIH_TARGET_COMBINED=0.94
 LIH_LEG1_SHARES=10
-LIH_LEG1_START_DELAY_SEC=7
+LIH_LEG1_START_DELAY_SEC=5
 LIH_LEG1_TREND_ALIGN=true
 LIH_TREND_LOOKBACK_SEC=60
 LIH_ENDGAME_SECS=100
@@ -80,7 +80,7 @@ Trend 仓库将 `LIH_LEG1_MODE=trend`，`LIH_LEG1_TREND_MAX_PRICE=0.65`；其余
 
 | 版本 | Git | 摘要 |
 |------|-----|------|
-| **v0.11.0-dual-mode** | `fb7e9eb` | `LIH_LEG1_MODE` cheap/trend；7s 延迟；target 0.94；endgame T-100；override 50s |
+| **v0.11.0-dual-mode** | `fb7e9eb` | `LIH_LEG1_MODE` cheap/trend；5s 延迟；target 0.94；endgame T-100；override 50s |
 | **v0.10.0-endgame** | `9b9c706` | 末段分批配平、软顶 1.15、顺势 hold ≥0.90 |
 | **v0.9.0-lih-baseline** | `0268601` | Leg1 趋势过滤 + 60s force；启动暂停 + reconcile merge |
 | v0.8.x | `6da72c1` | Reconcile merge 不抹对侧腿 |

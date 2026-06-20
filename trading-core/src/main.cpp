@@ -1051,7 +1051,7 @@ int main() {
         double lih_min_secs = env.count("LIH_MIN_SECONDS_REMAINING") ? std::stod(env["LIH_MIN_SECONDS_REMAINING"]) : 15.0;
         double lih_leg1_min_secs = env.count("LIH_LEG1_MIN_SECONDS_REMAINING")
             ? std::stod(env["LIH_LEG1_MIN_SECONDS_REMAINING"]) : 30.0;
-        double lih_leg1_start_delay = env_double_or(env, "LIH_LEG1_START_DELAY_SEC", 7.0);
+        double lih_leg1_start_delay = env_double_or(env, "LIH_LEG1_START_DELAY_SEC", 5.0);
         double lih_leg1_cooldown = 20.0;
         double lih_rebalance_cooldown = 5.0;
         if (env.count("LIH_LEG1_COOLDOWN_SECONDS")) {

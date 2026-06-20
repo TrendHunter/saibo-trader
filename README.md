@@ -14,12 +14,12 @@ Polymarket **5m / 15m Up-Down** 市场（BTC / ETH / SOL）自动交易。主策
 > 顺势买贵腿模式：[`saibo-trader-trend`](https://github.com/TrendHunter/saibo-trader-trend) 或 `LIH_LEG1_MODE=trend`（见 [`README_TREND.md`](README_TREND.md)）。
 
 ```
-开盘 +7s → leg1 便宜腿(≤0.45)+趋势过滤 → 利润对冲(≤0.94) → 末段配平 → 结算/redeem
+开盘 +5s → leg1 便宜腿(≤0.45)+趋势过滤 → 利润对冲(≤0.94) → 末段配平 → 结算/redeem
 ```
 
 | 阶段 | 条件 | 说明 |
 |------|------|------|
-| **开局延迟** | 开盘后 `LIH_LEG1_START_DELAY_SEC=7` | 前 7 秒 **不买**，等波动；7 秒后可买，**非强制** |
+| **开局延迟** | 开盘后 `LIH_LEG1_START_DELAY_SEC=5` | 前 5 秒 **不买**，等波动；5 秒后可买，**非强制** |
 | **Leg1** | ask ≤ `LIH_LEG1_MAX_PRICE`（0.45）+ `LIH_LEG1_TREND_ALIGN` | 买更便宜一侧；逆势则跳过 |
 | **利润对冲** | `heavy_avg + light_ask ≤ LIH_TARGET_COMBINED`（**0.94**） | 买对面配平 |
 | **末段 T≤100s** | 有 gap | 5/10 份分批补缺腿；合价软顶 **1.15** |

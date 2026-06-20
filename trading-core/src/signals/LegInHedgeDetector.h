@@ -28,7 +28,7 @@ public:
                        double target_combined = 0.94,
                        double min_seconds_remaining = 15.0,
                        double leg1_min_seconds_remaining = 30.0,
-                       double leg1_start_delay_sec = 7.0,
+                       double leg1_start_delay_sec = 5.0,
                        double leg1_cooldown_seconds = 20.0,
                        double rebalance_cooldown_seconds = 5.0,
                        bool use_mirror_prices = true,

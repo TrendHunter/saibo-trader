@@ -5,12 +5,12 @@
 ## 策略逻辑（一局）
 
 ```
-开盘 +7s → leg1 买 Binance 顺势一侧（ask ≤ 0.65）→ 利润对冲 ≤0.94 → 末段配平 → 结算
+开盘 +5s → leg1 买 Binance 顺势一侧（ask ≤ 0.65）→ 利润对冲 ≤0.94 → 末段配平 → 结算
 ```
 
 | 阶段 | 说明 |
 |------|------|
-| **开局延迟 7s** | 前 7 秒不买，等开盘波动 |
+| **开局延迟 5s** | 前 5 秒不买，等开盘波动 |
 | **Leg1 trend** | YES 当 spot 涨 / NO 当 spot 跌；ask ≤ `LIH_LEG1_TREND_MAX_PRICE`（默认 0.65） |
 | **利润对冲** | `heavy_avg + light_ask ≤ 0.94` |
 | **末段 T≤100s** | 5/10 份补缺腿；软顶 1.15 |
@@ -23,7 +23,7 @@
 LIH_LEG1_MODE=trend
 LIH_LEG1_TREND_MAX_PRICE=0.65
 LIH_TARGET_COMBINED=0.94
-LIH_LEG1_START_DELAY_SEC=7
+LIH_LEG1_START_DELAY_SEC=5
 LIH_ENDGAME_SECS=100
 LIH_ENDGAME_OVERRIDE_SECS=50
 LIH_ENDGAME_OVERRIDE_COOLDOWN=2
