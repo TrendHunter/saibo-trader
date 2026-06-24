@@ -43,6 +43,7 @@ from remote_deploy import (  # noqa: E402
 UPLOAD_FILES: list[tuple[str, str]] = [
     ("scripts/deploy_vps_full.sh", f"{PROJ}/scripts/deploy_vps_full.sh"),
     ("scripts/server_start_bot.sh", f"{PROJ}/server_start_bot.sh"),
+    ("scripts/server_start_web.sh", f"{PROJ}/server_start_web.sh"),
     ("scripts/server_stop_web.sh", f"{PROJ}/scripts/server_stop_web.sh"),
     ("scripts/server_restart_web.sh", f"{PROJ}/server_restart_web.sh"),
     ("scripts/web_run.sh", f"{PROJ}/scripts/web_run.sh"),
@@ -135,10 +136,15 @@ def run_deploy(
         f"SKIP_BUILD={'1' if skip_build else '0'}",
         f"SKIP_GIT={'1' if skip_git else '0'}",
     ]
+    chmod_targets = (
+        f"'{PROJ}/scripts/deploy_vps_full.sh' '{PROJ}/build-lowmem.sh' "
+        f"'{PROJ}/server_start_bot.sh'"
+    )
+    if not bot_only:
+        chmod_targets += f" '{PROJ}/server_start_web.sh'"
     cmd = (
-        f"chmod +x '{PROJ}/scripts/deploy_vps_full.sh' '{PROJ}/build-lowmem.sh' "
-        f"'{PROJ}/server_start_bot.sh' '{PROJ}/server_start_web.sh' && "
-        f"{ ' '.join(env_parts) } bash '{PROJ}/scripts/deploy_vps_full.sh'"
+        f"chmod +x {chmod_targets} && "
+        f"{' '.join(env_parts)} bash '{PROJ}/scripts/deploy_vps_full.sh'"
     )
     run(client, KILL_STALE_BUILD, timeout=60)
     rc = run(client, cmd, timeout=3600)

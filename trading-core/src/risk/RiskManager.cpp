@@ -6,6 +6,7 @@
 #include <ctime>
 #include <fstream>
 #include <filesystem>
+#include <chrono>
 #include <unordered_map>
 #include <boost/json.hpp>
 
@@ -17,7 +18,8 @@ constexpr double kFloatTol = 1e-6;
 void append_shadow_trade_log(boost::json::object row) {
     try {
         if (!row.contains("ts")) {
-            row["ts"] = RiskManager::now();
+            auto duration = std::chrono::system_clock::now().time_since_epoch();
+            row["ts"] = std::chrono::duration<double>(duration).count();
         }
         std::filesystem::create_directories("logs");
         std::ofstream out("logs/shadow_trades.jsonl", std::ios::app);
