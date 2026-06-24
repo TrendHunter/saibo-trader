@@ -13,6 +13,7 @@ Usage:
   python scripts/deploy_production.py --web-fast      # bot rebuild + web restart only
   python scripts/deploy_production.py --skip-build    # git pull + restart, no C++ compile
   python scripts/deploy_production.py --bot-only      # no web step
+  python scripts/deploy_production.py --bot-only --skip-build  # lightweight VPS (~1GB RAM)
   python scripts/deploy_production.py --setup         # first-time clone + venv + build + web.env hint
 """
 from __future__ import annotations
@@ -42,7 +43,7 @@ from remote_deploy import (  # noqa: E402
 UPLOAD_FILES: list[tuple[str, str]] = [
     ("scripts/deploy_vps_full.sh", f"{PROJ}/scripts/deploy_vps_full.sh"),
     ("scripts/server_start_bot.sh", f"{PROJ}/server_start_bot.sh"),
-    ("scripts/server_start_web.sh", f"{PROJ}/server_start_web.sh"),
+    ("scripts/server_stop_web.sh", f"{PROJ}/scripts/server_stop_web.sh"),
     ("scripts/server_restart_web.sh", f"{PROJ}/server_restart_web.sh"),
     ("scripts/web_run.sh", f"{PROJ}/scripts/web_run.sh"),
     ("scripts/web_watchdog.sh", f"{PROJ}/scripts/web_watchdog.sh"),
