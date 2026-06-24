@@ -23,7 +23,7 @@ def main():
     c.connect(HOST, username=USER, password=load_password(), timeout=60)
     try:
         print("=== ENV ===")
-        print(ro(c, f"grep -E '^(LIVE_LIH_DRY_RUN|LIH_ENABLED|RISK_MAX|LIH_PAUSE|AUTO_REDEEM)=' '{PROJ}/.env'"))
+        print(ro(c, f"grep -E '^(LIVE_LIH_DRY_RUN|RISK_MAX|LIH_PAUSE|AUTO_REDEEM|LIH_LEG1_MODE)=' '{PROJ}/.env'"))
 
         print("\n=== PROCESSES ===")
         print(ro(c, "pgrep -af 'start_bot|trading-core' | grep -v pgrep || echo DOWN"))
