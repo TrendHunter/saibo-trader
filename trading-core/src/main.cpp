@@ -503,18 +503,20 @@ void check_and_close_lih_positions(
             const double proceeds = matched * 1.0;
             const double cost = p.yes_cost + p.no_cost;
             if (risk_manager.register_lih_close(id, ey, en, "Market resolved (hedged)", now)) {
+                const char* tag = p.is_shadow ? "SHADOW" : "LIVE";
                 store.push_telemetry(fmt::format(
-                    "[LIH LIVE] CLOSED {} | {} hedged {:.2f}sh | PnL ~${:+.2f} | YES={:.0f} NO={:.0f}",
-                    id, p.asset, matched, proceeds - cost, ey, en));
+                    "[LIH {}] CLOSED {} | {} hedged {:.2f}sh | PnL ~${:+.2f} | YES={:.0f} NO={:.0f}",
+                    tag, id, p.asset, matched, proceeds - cost, ey, en));
                 if (live_state_path && !live_state_path->empty()) {
                     persistence::save_live_lih_state(risk_manager, *live_state_path, false);
                 }
             }
         } else {
             risk_manager.register_lih_close(id, ey, en, "Market resolved (unhedged)", now);
+            const char* tag = p.is_shadow ? "SHADOW" : "LIVE";
             store.push_telemetry(fmt::format(
-                "[LIH LIVE] CLOSED {} | {} UNHEDGED | yes={:.2f} no={:.2f} | YES={:.0f} NO={:.0f}",
-                id, p.asset, p.yes_shares, p.no_shares, ey, en));
+                "[LIH {}] CLOSED {} | {} UNHEDGED | yes={:.2f} no={:.2f} | YES={:.0f} NO={:.0f}",
+                tag, id, p.asset, p.yes_shares, p.no_shares, ey, en));
             if (live_state_path && !live_state_path->empty()) {
                 persistence::save_live_lih_state(risk_manager, *live_state_path, false);
             }

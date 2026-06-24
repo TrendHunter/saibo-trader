@@ -4,6 +4,8 @@
 #include <cmath>
 #include <algorithm>
 #include <ctime>
+#include <fstream>
+#include <filesystem>
 #include <unordered_map>
 #include <boost/json.hpp>
 
@@ -11,6 +13,39 @@ namespace risk {
 
 namespace {
 constexpr double kFloatTol = 1e-6;
+
+void append_shadow_trade_log(boost::json::object row) {
+    try {
+        if (!row.contains("ts")) {
+            row["ts"] = RiskManager::now();
+        }
+        std::filesystem::create_directories("logs");
+        std::ofstream out("logs/shadow_trades.jsonl", std::ios::app);
+        if (!out) return;
+        out << boost::json::serialize(row) << '\n';
+    } catch (...) {
+    }
+}
+
+boost::json::object shadow_leg_snapshot(const LegInHedgePosition& p) {
+    boost::json::object o;
+    o["id"] = p.lih_id;
+    o["asset"] = p.asset;
+    o["windowMinutes"] = p.window_minutes;
+    o["yesShares"] = p.yes_shares;
+    o["noShares"] = p.no_shares;
+    o["yesEntryPrice"] = p.yes_entry_price;
+    o["noEntryPrice"] = p.no_entry_price;
+    const double combined = p.yes_entry_price + p.no_entry_price;
+    o["combinedEntry"] = combined;
+    o["costUsdc"] = p.yes_cost + p.no_cost;
+    const double matched = std::min(p.yes_shares, p.no_shares);
+    const double gap = std::abs(p.yes_shares - p.no_shares);
+    o["matchedShares"] = matched;
+    o["gap"] = gap;
+    o["fullyHedged"] = matched >= 1.0 && gap <= 0.5;
+    return o;
+}
 } // namespace
 
 double RiskManager::now() {
@@ -917,6 +952,10 @@ void RiskManager::consolidate_closed_lih_positions() {
     lih_pnl_ = lih_sum;
     total_pnl_ = lih_pnl_ + la_pnl_;
 
+    for (const auto& p : sorted) {
+        if (p.is_shadow) merged.push_back(p);
+    }
+
     if (merged.size() != before) {
         spdlog::info("[LIH] closed history consolidated {} -> {} row(s), lih_pnl ${:+.2f}",
                      before, merged.size(), lih_pnl_);
@@ -1073,6 +1112,17 @@ LegInHedgePosition RiskManager::register_lih_open_leg1(
     spdlog::info("[LIH {}] LEG1 {} | {} {:.2f}sh @ {:.4f} | cost ${:.2f} | bal ${:.2f}",
                  mode_tag,
                  pos.lih_id, buy_yes ? "YES" : "NO", shares, price, cost, current_balance_);
+    if (is_shadow) {
+        boost::json::object row;
+        row["event"] = "LEG1";
+        row["side"] = buy_yes ? "YES" : "NO";
+        row["price"] = price;
+        row["shares"] = shares;
+        row["market"] = market.question;
+        auto snap = shadow_leg_snapshot(pos);
+        for (const auto& kv : snap) row[kv.key()] = kv.value();
+        append_shadow_trade_log(std::move(row));
+    }
     return pos;
 }
 
@@ -1123,6 +1173,17 @@ void RiskManager::register_lih_add_leg(
                  mode_tag,
                  lih_id, buy_yes ? "YES" : "NO", shares, price,
                  it->second.yes_shares, it->second.no_shares, n, current_balance_);
+    if (!debit_balance) {
+        boost::json::object row;
+        row["event"] = "HEDGE";
+        row["side"] = buy_yes ? "YES" : "NO";
+        row["price"] = price;
+        row["shares"] = shares;
+        row["rebalanceCount"] = n;
+        auto snap = shadow_leg_snapshot(it->second);
+        for (const auto& kv : snap) row[kv.key()] = kv.value();
+        append_shadow_trade_log(std::move(row));
+    }
 }
 
 void RiskManager::register_lih_add_paired(
@@ -1149,6 +1210,17 @@ void RiskManager::register_lih_add_paired(
     spdlog::info("[LIH {}] SCALE {} | +{:.2f} paired | YES {:.2f} NO {:.2f} | #{:d} | bal ${:.2f}",
                  mode_tag,
                  lih_id, shares, it->second.yes_shares, it->second.no_shares, n, current_balance_);
+    if (!debit_balance) {
+        boost::json::object row;
+        row["event"] = "SCALE";
+        row["yesPrice"] = yes_price;
+        row["noPrice"] = no_price;
+        row["shares"] = shares;
+        row["rebalanceCount"] = n;
+        auto snap = shadow_leg_snapshot(it->second);
+        for (const auto& kv : snap) row[kv.key()] = kv.value();
+        append_shadow_trade_log(std::move(row));
+    }
 }
 
 std::optional<LegInHedgePosition> RiskManager::register_lih_close(
@@ -1168,12 +1240,6 @@ std::optional<LegInHedgePosition> RiskManager::register_lih_close(
     if (it == open_lih_positions_.end()) return std::nullopt;
 
     LegInHedgePosition pos = it->second;
-    if (pos.is_shadow) {
-        open_lih_positions_.erase(it);
-        lih_rebalance_inflight_.erase(lih_id);
-        spdlog::info("[LIH SHADOW] discarded {} | {} (no trade record)", lih_id, exit_reason);
-        return std::nullopt;
-    }
 
     const double matched = std::min(pos.yes_shares, pos.no_shares);
     const double yes_proceeds = pos.yes_shares * yes_exit;
@@ -1188,11 +1254,13 @@ std::optional<LegInHedgePosition> RiskManager::register_lih_close(
     pos.no_exit_price = no_exit;
     pos.pnl_usdc = pnl;
     pos.exit_reason = exit_reason;
-    current_balance_ += proceeds;
-    lih_pnl_ += pnl;
-    total_pnl_ += pnl;
-    if (pnl > 0) winning_trades_++;
-    record_asset_close(pos.asset, pnl, pnl > 0);
+    if (!pos.is_shadow) {
+        current_balance_ += proceeds;
+        lih_pnl_ += pnl;
+        total_pnl_ += pnl;
+        if (pnl > 0) winning_trades_++;
+        record_asset_close(pos.asset, pnl, pnl > 0);
+    }
 
     open_lih_positions_.erase(it);
     lih_rebalance_inflight_.erase(lih_id);
@@ -1206,16 +1274,30 @@ std::optional<LegInHedgePosition> RiskManager::register_lih_close(
         closed_lih_positions_.erase(closed_lih_positions_.begin());
     }
 
+    const char* close_tag = pos.is_shadow ? "SHADOW" : (pos.paper_mode ? "PAPER" : "LIVE");
     spdlog::info("[LIH {}] CLOSED {} | matched {:.2f} | PnL ${:+.2f} | rebal #{:d} | {} | bal ${:.2f}",
-                 pos.paper_mode ? "PAPER" : "LIVE",
+                 close_tag,
                  lih_id, matched, pnl, pos.rebalance_count, exit_reason, current_balance_);
-    if (!pos.paper_mode) {
+    if (pos.is_shadow) {
+        boost::json::object row;
+        row["event"] = "CLOSED";
+        row["exitReason"] = exit_reason;
+        row["yesExitPrice"] = yes_exit;
+        row["noExitPrice"] = no_exit;
+        row["pnlUsdc"] = pnl;
+        row["rebalanceCount"] = pos.rebalance_count;
+        auto snap = shadow_leg_snapshot(pos);
+        for (const auto& kv : snap) row[kv.key()] = kv.value();
+        append_shadow_trade_log(std::move(row));
+    } else if (!pos.paper_mode) {
         // DEBUG single-round test: re-enable auto-pause on round close (LIH_PAUSE_AFTER_ROUND).
         // maybe_pause_after_lih_round(exit_reason);
         reset_lih_session();
     }
-    check_risk_thresholds();
-    consolidate_closed_lih_positions();
+    if (!pos.is_shadow) {
+        check_risk_thresholds();
+        consolidate_closed_lih_positions();
+    }
     return pos;
 }
 
@@ -1268,16 +1350,9 @@ int RiskManager::purge_expired_lih_open(double now_sec, double grace_sec) {
             if (it != open_lih_positions_.end()) shadow = it->second.is_shadow;
         }
         if (shadow) {
-            std::lock_guard<std::recursive_mutex> lock(mtx_);
-            auto it = open_lih_positions_.find(id);
-            if (it != open_lih_positions_.end()) {
-                const std::string key = lih_slot_key(it->second.asset, it->second.window_minutes);
-                lih_leg1_inflight_.erase(key);
-                lih_leg1_inflight_since_.erase(key);
-                open_lih_positions_.erase(it);
+            if (register_lih_close(id, 0.5, 0.5, "Expired window (shadow)", now_sec)) {
+                closed++;
             }
-            lih_rebalance_inflight_.erase(id);
-            closed++;
             continue;
         }
         if (register_lih_close(id, 0.5, 0.5, "Expired window (purged)", now_sec)) {

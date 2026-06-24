@@ -760,6 +760,90 @@ std::string StateStore::get_dashboard_json() const {
             push_hist({p.opened_at, std::move(h)});
         }
 
+        // Shadow simulated trades (LIVE_LIH_DRY_RUN) — separate from live tradeHistory
+        std::vector<HistRow> shadow_rows;
+        auto push_shadow = [&](HistRow row) { shadow_rows.push_back(std::move(row)); };
+        double shadow_pnl_sum = 0.0;
+
+        auto lih_shadow_hist = [&](const risk::LegInHedgePosition& p, const char* status) {
+            if (!p.is_shadow) return;
+            const double yes_avg = p.yes_entry_price > 0 ? p.yes_entry_price
+                : (p.yes_shares > 0 ? p.yes_cost / p.yes_shares : 0.0);
+            const double no_avg = p.no_entry_price > 0 ? p.no_entry_price
+                : (p.no_shares > 0 ? p.no_cost / p.no_shares : 0.0);
+            const double matched = std::min(p.yes_shares, p.no_shares);
+            const double gap = std::abs(p.yes_shares - p.no_shares);
+            const bool fully_hedged = matched >= 1.0 && gap <= 0.5;
+            boost::json::object h;
+            h["id"] = p.lih_id.c_str();
+            h["strategy"] = "LIH-SHADOW";
+            h["isShadow"] = true;
+            h["asset"] = p.asset.c_str();
+            h["status"] = status;
+            h["market"] = p.market_question.c_str();
+            h["windowMinutes"] = p.window_minutes;
+            h["yesEntryPrice"] = yes_avg;
+            h["noEntryPrice"] = no_avg;
+            h["entryPrice"] = yes_avg + no_avg;
+            h["yesSize"] = p.yes_shares;
+            h["noSize"] = p.no_shares;
+            h["size"] = matched > 0 ? matched : std::max(p.yes_shares, p.no_shares);
+            h["costUsdc"] = p.yes_cost + p.no_cost;
+            h["entryFee"] = p.entry_fees > 0 ? p.entry_fees : (p.yes_cost + p.no_cost) * fr;
+            h["gap"] = gap;
+            h["fullyHedged"] = fully_hedged;
+            h["rebalanceCount"] = p.rebalance_count;
+            h["openedAt"] = p.opened_at;
+            h["endDateTs"] = p.end_date_ts;
+            if (std::string(status) == "closed") {
+                h["yesExitPrice"] = p.yes_exit_price.value_or(0.0);
+                h["noExitPrice"] = p.no_exit_price.value_or(0.0);
+                h["exitPrice"] = p.yes_exit_price.value_or(0.0) + p.no_exit_price.value_or(0.0);
+                h["exitFee"] = (p.yes_shares * p.yes_exit_price.value_or(0.0)
+                    + p.no_shares * p.no_exit_price.value_or(0.0)) * fr;
+                h["pnlUsdc"] = p.pnl_usdc.value_or(0.0);
+                h["closedAt"] = p.closed_at.value_or(0.0);
+                h["exitReason"] = p.exit_reason.c_str();
+                shadow_pnl_sum += p.pnl_usdc.value_or(0.0);
+            } else {
+                const double yes_bid = token_mark(p.yes_token_id);
+                const double no_bid = token_mark(p.no_token_id);
+                double unreal = 0.0;
+                if (matched > 0.0) unreal += matched * (1.0 - yes_avg - no_avg);
+                const double excess_yes = std::max(0.0, p.yes_shares - matched);
+                const double excess_no = std::max(0.0, p.no_shares - matched);
+                if (excess_yes > 0.0 && yes_bid > 0.0) unreal += excess_yes * (yes_bid - yes_avg);
+                if (excess_no > 0.0 && no_bid > 0.0) unreal += excess_no * (no_bid - no_avg);
+                h["pnlUsdc"] = unreal;
+                h["closedAt"] = 0.0;
+                h["exitReason"] = "";
+            }
+            const double sort_ts = std::string(status) == "closed"
+                ? p.closed_at.value_or(p.opened_at) : p.opened_at;
+            push_shadow({sort_ts, std::move(h)});
+        };
+
+        for (const auto& p : risk_manager_->get_closed_lih_positions()) {
+            lih_shadow_hist(p, "closed");
+        }
+        for (const auto& [id, p] : risk_manager_->get_open_lih_positions()) {
+            (void)id;
+            lih_shadow_hist(p, "open");
+        }
+
+        std::sort(shadow_rows.begin(), shadow_rows.end(),
+                  [](const HistRow& a, const HistRow& b) { return a.sort_ts > b.sort_ts; });
+        int64_t shadow_open = 0;
+        for (const auto& [id, p] : risk_manager_->get_open_lih_positions()) {
+            (void)id;
+            if (p.is_shadow) ++shadow_open;
+        }
+        boost::json::array shadow_arr;
+        for (auto& row : shadow_rows) shadow_arr.push_back(std::move(row.obj));
+        root["shadowTradeHistory"] = std::move(shadow_arr);
+        root["shadowLihPnl"] = shadow_pnl_sum;
+        root["shadowOpenCount"] = shadow_open;
+
         std::sort(hist_rows.begin(), hist_rows.end(),
                   [](const HistRow& a, const HistRow& b) { return a.sort_ts > b.sort_ts; });
         // Dedupe by trade id (keep newest row per id).
@@ -800,6 +884,9 @@ std::string StateStore::get_dashboard_json() const {
         root["status"] = 0;
         root["openPositions"] = boost::json::array{};
         root["tradeHistory"] = boost::json::array{};
+        root["shadowTradeHistory"] = boost::json::array{};
+        root["shadowLihPnl"] = 0.0;
+        root["shadowOpenCount"] = 0;
     }
 
     boost::json::array opps;
