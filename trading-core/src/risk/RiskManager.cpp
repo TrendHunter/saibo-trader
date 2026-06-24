@@ -126,10 +126,6 @@ int RiskManager::get_open_position_count() const {
         (void)id;
         if (!p.paper_mode) ++n;
     }
-    for (const auto& [id, p] : open_dh_positions_) {
-        (void)id;
-        if (!p.paper_mode) ++n;
-    }
     for (const auto& [id, p] : open_lih_positions_) {
         (void)id;
         if (!p.paper_mode && !p.is_shadow) ++n;
@@ -140,7 +136,7 @@ int RiskManager::get_open_position_count() const {
 double RiskManager::get_win_rate() const {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     // Use persisted trade counters — closed_* arrays may be truncated on paper-state export.
-    int closed = total_trades_ + total_dh_trades_ + total_lih_trades_;
+    int closed = total_trades_ + total_lih_trades_;
     if (closed == 0) return 0.0;
     double rate = static_cast<double>(winning_trades_) / closed;
     return std::min(rate, 1.0);
@@ -156,19 +152,9 @@ double RiskManager::get_la_pnl() const {
     return la_pnl_;
 }
 
-double RiskManager::get_dh_pnl() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return dh_pnl_;
-}
-
 int RiskManager::get_total_trades() const {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     return total_trades_;
-}
-
-int RiskManager::get_total_dh_trades() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return total_dh_trades_;
 }
 
 int RiskManager::get_total_lih_trades() const {
@@ -201,19 +187,9 @@ std::unordered_map<std::string, Position> RiskManager::get_open_positions() cons
     return open_positions_;
 }
 
-std::unordered_map<std::string, DumpHedgePosition> RiskManager::get_open_dh_positions() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return open_dh_positions_;
-}
-
 std::vector<Position> RiskManager::get_closed_positions() const {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     return closed_positions_;
-}
-
-std::vector<DumpHedgePosition> RiskManager::get_closed_dh_positions() const {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    return closed_dh_positions_;
 }
 
 std::vector<LegInHedgePosition> RiskManager::get_closed_lih_positions() const {
@@ -348,108 +324,6 @@ std::optional<Position> RiskManager::register_trade_close(
     return pos;
 }
 
-std::pair<bool, std::string> RiskManager::can_open_dh_position(double combined_cost_usdc) {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    if (!is_trading_allowed()) {
-        return {false, "Trading halted: " + kill_reason_.value_or("N/A")};
-    }
-
-    if (get_open_position_count() >= max_concurrent_positions_) {
-        return {false, "Max concurrent positions reached (" + std::to_string(max_concurrent_positions_) + ")"};
-    }
-
-    double max_allowed = current_balance_ * max_position_fraction_;
-    if (combined_cost_usdc > max_allowed) {
-        return {false, "DH cost exceeds max allowed"};
-    }
-
-    if (combined_cost_usdc > current_balance_) {
-        return {false, "Insufficient balance"};
-    }
-
-    return {true, "OK"};
-}
-
-void RiskManager::register_dh_open(const DumpHedgePosition& position) {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    open_dh_positions_[position.dh_id] = position;
-    double entry_fee = position.combined_cost_usdc * fee_rate_;
-    current_balance_ -= (position.combined_cost_usdc + entry_fee);
-
-    spdlog::info("DH Position OPENED | {} | ${:.2f} USDC (+ ${:.2f} fee) | Locked: ${:.2f} | Balance: ${:.2f}",
-                 position.dh_id, position.combined_cost_usdc, entry_fee, position.locked_profit_usdc, current_balance_);
-}
-
-std::optional<DumpHedgePosition> RiskManager::register_dh_close(
-    const std::string& dh_id,
-    double yes_exit_price,
-    double no_exit_price,
-    const std::string& exit_reason,
-    std::optional<double> exit_timestamp,
-    std::optional<double> actual_proceeds_usdc
-) {
-    std::lock_guard<std::recursive_mutex> lock(mtx_);
-    auto it = open_dh_positions_.find(dh_id);
-    if (it == open_dh_positions_.end()) {
-        spdlog::warn("register_dh_close: dh_id {} not found", dh_id);
-        return std::nullopt;
-    }
-
-    DumpHedgePosition pos = it->second;
-    open_dh_positions_.erase(it);
-
-    pos.closed_at = exit_timestamp.value_or(now());
-    pos.yes_exit_price = yes_exit_price;
-    pos.no_exit_price = no_exit_price;
-    pos.exit_reason = exit_reason;
-
-    double pnl = 0.0;
-    if (actual_proceeds_usdc.has_value()) {
-        pnl = actual_proceeds_usdc.value() - pos.combined_cost_usdc - (pos.combined_cost_usdc * fee_rate_);
-        current_balance_ += actual_proceeds_usdc.value();
-    } else {
-        double gross = (yes_exit_price + no_exit_price) * pos.size_shares;
-        double exit_fee = gross * fee_rate_;
-        double net = gross - exit_fee;
-        double entry_fee = pos.combined_cost_usdc * fee_rate_;
-        pnl = net - pos.combined_cost_usdc - entry_fee;
-        current_balance_ += net;
-    }
-
-    pos.pnl_usdc = pnl;
-    total_pnl_ += pnl;
-    dh_pnl_ += pnl;
-    total_dh_trades_++;
-
-    bool won = pnl > 0.0;
-    if (won) winning_trades_++;
-
-    record_asset_close(pos.asset, pnl, won);
-
-    if (current_balance_ > peak_balance_) {
-        peak_balance_ = current_balance_;
-    }
-
-    closed_dh_positions_.push_back(pos);
-    if (closed_dh_positions_.size() > 1000) {
-        closed_dh_positions_.erase(closed_dh_positions_.begin());
-    }
-
-    spdlog::info("DH Position CLOSED | {} | PnL: ${:+.2f} | Reason: {} | Balance: ${:.2f}",
-                 dh_id, pnl, exit_reason, current_balance_);
-
-    check_risk_thresholds();
-    
-    recent_dh_pnls_.push_back(pnl);
-    if(recent_dh_pnls_.size() > static_cast<size_t>(circuit_breaker_window_)) {
-        recent_dh_pnls_.pop_front();
-    }
-    
-    check_circuit_breaker();
-
-    return pos;
-}
-
 std::pair<bool, std::string> RiskManager::can_open_lih_leg(
     double leg_cost_usdc,
     bool add_to_existing_lih,
@@ -488,7 +362,7 @@ std::pair<bool, std::string> RiskManager::can_open_lih_leg(
     if (leg_cost_usdc > current_balance_) {
         return {false, "Insufficient balance"};
     }
-    // LIH per-leg exchange minimum is ~$1 (detector enforces); MIN_ORDER_SIZE is for DH whole tickets.
+    // LIH per-leg exchange minimum is ~$1 (detector enforces).
     constexpr double kLihMinLegUsdc = 1.0;
     if (leg_cost_usdc + 1e-6 < kLihMinLegUsdc) {
         return {false, "LIH leg below $1 exchange minimum"};
@@ -814,14 +688,6 @@ void RiskManager::purge_paper_positions() {
             ++it;
         }
     }
-    for (auto it = open_dh_positions_.begin(); it != open_dh_positions_.end(); ) {
-        if (it->second.paper_mode) {
-            it = open_dh_positions_.erase(it);
-            ++dropped;
-        } else {
-            ++it;
-        }
-    }
     for (auto it = open_lih_positions_.begin(); it != open_lih_positions_.end(); ) {
         if (it->second.paper_mode || it->second.is_shadow) {
             lih_rebalance_inflight_.erase(it->first);
@@ -1049,7 +915,7 @@ void RiskManager::consolidate_closed_lih_positions() {
         lih_sum += p.pnl_usdc.value_or(0.0);
     }
     lih_pnl_ = lih_sum;
-    total_pnl_ = lih_pnl_ + dh_pnl_ + la_pnl_;
+    total_pnl_ = lih_pnl_ + la_pnl_;
 
     if (merged.size() != before) {
         spdlog::info("[LIH] closed history consolidated {} -> {} row(s), lih_pnl ${:+.2f}",
@@ -1559,10 +1425,6 @@ double RiskManager::compute_equity_unlocked() const {
         (void)id;
         equity += p.cost_usdc;
     }
-    for (const auto& [id, p] : open_dh_positions_) {
-        (void)id;
-        equity += p.combined_cost_usdc;
-    }
     for (const auto& [id, p] : open_lih_positions_) {
         (void)id;
         equity += p.yes_cost + p.no_cost;
@@ -1579,7 +1441,7 @@ void RiskManager::reconcile_paper_balance(bool reset_trading_halt) {
         if (p.entry_fees <= 0.0) all_closed_have_entry_fees = false;
     }
     lih_pnl_ = lih_sum;
-    total_pnl_ = lih_pnl_ + dh_pnl_ + la_pnl_;
+    total_pnl_ = lih_pnl_ + la_pnl_;
 
     const double old = current_balance_;
     if (all_closed_have_entry_fees) {
@@ -1673,9 +1535,8 @@ void RiskManager::check_circuit_breaker() {
         return std::nullopt;
     };
 
-    if (auto msg = evaluate_cb(recent_dh_pnls_, "DH")) {
+    if (auto msg = evaluate_cb(recent_la_pnls_, "LA")) {
         spdlog::warn("{}", *msg);
-        return;
     }
 }
 
@@ -1686,7 +1547,6 @@ void RiskManager::check_circuit_breaker_resume() {
         status_ = TradingStatus::ACTIVE;
         kill_reason_ = std::nullopt;
         recent_la_pnls_.clear();
-        recent_dh_pnls_.clear();
         spdlog::info("Circuit breaker pause expired - trading RESUMED.");
     }
 }
@@ -1800,73 +1660,6 @@ bool position_from_json(const boost::json::object& o, Position& p) {
         p.pnl_usdc = std::nullopt;
         if (o.contains("closed_at")) p.closed_at = o.at("closed_at").as_double();
         if (o.contains("exit_price")) p.exit_price = o.at("exit_price").as_double();
-        if (o.contains("pnl_usdc")) p.pnl_usdc = o.at("pnl_usdc").as_double();
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-boost::json::object dh_position_to_json(const DumpHedgePosition& p) {
-    boost::json::object o;
-    o["dh_id"] = p.dh_id;
-    o["yes_order_id"] = p.yes_order_id;
-    o["no_order_id"] = p.no_order_id;
-    o["yes_token_id"] = p.yes_token_id;
-    o["no_token_id"] = p.no_token_id;
-    o["market_question"] = p.market_question;
-    o["asset"] = p.asset;
-    o["yes_entry_price"] = p.yes_entry_price;
-    o["no_entry_price"] = p.no_entry_price;
-    o["combined_entry_price"] = p.combined_entry_price;
-    o["size_shares"] = p.size_shares;
-    o["combined_cost_usdc"] = p.combined_cost_usdc;
-    o["locked_profit_usdc"] = p.locked_profit_usdc;
-    o["opened_at"] = p.opened_at;
-    o["end_date_ts"] = p.end_date_ts;
-    o["paper_mode"] = p.paper_mode;
-    o["strategy"] = p.strategy;
-    o["is_neg_risk"] = p.is_neg_risk;
-    o["window_minutes"] = p.window_minutes;
-    if (!p.condition_id.empty()) o["condition_id"] = p.condition_id;
-    o["exit_reason"] = p.exit_reason;
-    if (p.closed_at) o["closed_at"] = *p.closed_at;
-    if (p.yes_exit_price) o["yes_exit_price"] = *p.yes_exit_price;
-    if (p.no_exit_price) o["no_exit_price"] = *p.no_exit_price;
-    if (p.pnl_usdc) o["pnl_usdc"] = *p.pnl_usdc;
-    return o;
-}
-
-bool dh_position_from_json(const boost::json::object& o, DumpHedgePosition& p) {
-    try {
-        p.dh_id = std::string(o.at("dh_id").as_string());
-        p.yes_order_id = o.contains("yes_order_id") ? std::string(o.at("yes_order_id").as_string()) : "";
-        p.no_order_id = o.contains("no_order_id") ? std::string(o.at("no_order_id").as_string()) : "";
-        p.yes_token_id = o.contains("yes_token_id") ? std::string(o.at("yes_token_id").as_string()) : "";
-        p.no_token_id = o.contains("no_token_id") ? std::string(o.at("no_token_id").as_string()) : "";
-        p.market_question = o.contains("market_question") ? std::string(o.at("market_question").as_string()) : "";
-        p.asset = o.contains("asset") ? std::string(o.at("asset").as_string()) : "";
-        p.yes_entry_price = o.at("yes_entry_price").as_double();
-        p.no_entry_price = o.at("no_entry_price").as_double();
-        p.combined_entry_price = o.at("combined_entry_price").as_double();
-        p.size_shares = o.at("size_shares").as_double();
-        p.combined_cost_usdc = o.at("combined_cost_usdc").as_double();
-        p.locked_profit_usdc = o.contains("locked_profit_usdc") ? o.at("locked_profit_usdc").as_double() : 0.0;
-        p.opened_at = o.at("opened_at").as_double();
-        p.end_date_ts = o.contains("end_date_ts") ? o.at("end_date_ts").as_double() : 0.0;
-        p.paper_mode = o.contains("paper_mode") && o.at("paper_mode").as_bool();
-        p.strategy = o.contains("strategy") ? std::string(o.at("strategy").as_string()) : "DH";
-        p.is_neg_risk = o.contains("is_neg_risk") && o.at("is_neg_risk").as_bool();
-        p.window_minutes = o.contains("window_minutes") ? static_cast<int>(o.at("window_minutes").as_int64()) : 5;
-        p.condition_id = o.contains("condition_id") ? std::string(o.at("condition_id").as_string()) : "";
-        p.exit_reason = o.contains("exit_reason") ? std::string(o.at("exit_reason").as_string()) : "";
-        p.closed_at = std::nullopt;
-        p.yes_exit_price = std::nullopt;
-        p.no_exit_price = std::nullopt;
-        p.pnl_usdc = std::nullopt;
-        if (o.contains("closed_at")) p.closed_at = o.at("closed_at").as_double();
-        if (o.contains("yes_exit_price")) p.yes_exit_price = o.at("yes_exit_price").as_double();
-        if (o.contains("no_exit_price")) p.no_exit_price = o.at("no_exit_price").as_double();
         if (o.contains("pnl_usdc")) p.pnl_usdc = o.at("pnl_usdc").as_double();
         return true;
     } catch (...) {

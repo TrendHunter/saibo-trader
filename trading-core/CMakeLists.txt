@@ -48,7 +48,6 @@ set(SOURCES
     src/risk/RiskManager.cpp
     src/exec/EIP712Signer.cpp
     src/exec/OrderRouter.cpp
-    src/signals/DumpHedgeDetector.cpp
     src/signals/LegInHedgeDetector.cpp
 )
 

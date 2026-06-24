@@ -9,13 +9,6 @@
 
 namespace trading {
 
-namespace {
-double effective_platform_fee_per_share(double price, const StateStore::TokenFeeParams& p) {
-    if (!p.from_api || p.rate <= 0.0 || price <= 0.0 || price >= 1.0) return 0.0;
-    return p.rate * std::pow(price * (1.0 - price), p.exponent);
-}
-} // namespace
-
 void StateStore::set_token_fee_params(const std::string& token_id, double rate, double exponent) {
     std::unique_lock lock(token_mutex_);
     token_fee_params_[token_id] = TokenFeeParams{rate, exponent, rate > 0.0};
@@ -26,19 +19,6 @@ StateStore::TokenFeeParams StateStore::get_token_fee_params(std::string_view tok
     auto it = token_fee_params_.find(std::string(token_id));
     if (it != token_fee_params_.end()) return it->second;
     return {};
-}
-
-double StateStore::compute_dh_entry_fee_per_share(
-    double yes_price, double no_price,
-    const std::string& yes_token_id, const std::string& no_token_id) const
-{
-    auto yes_fee = get_token_fee_params(yes_token_id);
-    auto no_fee = get_token_fee_params(no_token_id);
-    if (yes_fee.from_api || no_fee.from_api) {
-        return effective_platform_fee_per_share(yes_price, yes_fee)
-             + effective_platform_fee_per_share(no_price, no_fee);
-    }
-    return (yes_price + no_price) * fee_rate_;
 }
 
 namespace {
@@ -358,7 +338,7 @@ std::optional<StateStore::DetectionAsk> StateStore::get_detection_ask(
     auto ws_it = ws_book_asks_.find(key);
     if (ws_it != ws_book_asks_.end() && ws_it->second.price > 0.0) {
         out.ws_book_ask = ws_it->second.price;
-        out.ws_ok = (now - ws_it->second.ts) <= 30.0;
+        out.ws_ok = (now - ws_it->second.ts) <= 2.0;
     }
     auto rest_it = rest_book_asks_.find(key);
     if (rest_it != rest_book_asks_.end() && rest_it->second.price > 0.0) {
@@ -433,10 +413,6 @@ std::string StateStore::get_dashboard_json() const {
     }
 
     root["strategy"] = strategy_.c_str();
-    root["dhSumTarget"] = dh_sum_target_;
-    root["dhMinDiscount"] = dh_min_discount_;
-    root["dhCooldownSeconds"] = dh_cooldown_seconds_;
-    root["dhMinSecondsRemaining"] = dh_min_seconds_remaining_;
     root["dhEnable5m"] = dh_enable_5m_;
     root["dhEnable15m"] = dh_enable_15m_;
     root["dhEnable5mBtc"] = dh_5m_btc_;
@@ -446,7 +422,6 @@ std::string StateStore::get_dashboard_json() const {
     root["dhEnable15mEth"] = dh_15m_eth_;
     root["binanceFeedEnabled"] = binance_feed_enabled_;
     root["lihEnabled"] = lih_enabled_;
-    root["lihDisableDh"] = lih_disable_dh_;
     root["lihLeg1MaxPrice"] = lih_leg1_max_price_;
     root["lihTargetCombined"] = lih_target_combined_;
     root["lihUseMirror"] = lih_use_mirror_;
@@ -466,8 +441,7 @@ std::string StateStore::get_dashboard_json() const {
         double daily_pnl = balance - daily_start;
         double total_pnl = balance - start;
         if (!paper_mode_ && trades_baseline_ts_ > 0) {
-            total_pnl = risk_manager_->get_lih_pnl() + risk_manager_->get_dh_pnl() +
-                        risk_manager_->get_la_pnl();
+            total_pnl = risk_manager_->get_lih_pnl() + risk_manager_->get_la_pnl();
         }
         double drawdown = peak > 0 ? (peak - balance) / peak * 100.0 : 0.0;
 
@@ -479,11 +453,11 @@ std::string StateStore::get_dashboard_json() const {
         root["maxDrawdownPct"] = drawdown;
         root["openCount"] = risk_manager_->get_open_position_count();
         root["totalTrades"] = risk_manager_->get_total_trades();
-        root["totalDhTrades"] = risk_manager_->get_total_dh_trades();
+        root["totalDhTrades"] = 0;
         root["totalLihTrades"] = risk_manager_->get_total_lih_trades();
         root["winRate"] = risk_manager_->get_win_rate() * 100.0;
         root["laPnl"] = risk_manager_->get_la_pnl();
-        root["dhPnl"] = risk_manager_->get_dh_pnl();
+        root["dhPnl"] = 0.0;
         root["lihPnl"] = risk_manager_->get_lih_pnl();
         root["status"] = static_cast<int>(risk_manager_->get_status());
         if (auto reason = risk_manager_->get_status_reason()) {
@@ -592,43 +566,6 @@ std::string StateStore::get_dashboard_json() const {
             po["pnl"] = unrealised;
             pos_arr.push_back(po);
         }
-        for (const auto& [id, p] : risk_manager_->get_open_dh_positions()) {
-            boost::json::object po;
-            po["asset"] = p.asset.c_str();
-            po["side"] = "DUAL";
-            po["entryPrice"] = p.combined_entry_price;
-            po["size"] = p.size_shares;
-            po["cost"] = p.combined_cost_usdc;
-            po["strategy"] = "DH";
-            po["windowMinutes"] = p.window_minutes;
-            po["question"] = p.market_question.c_str();
-            po["endDateTs"] = p.end_date_ts;
-            po["heldSide"] = "BOTH";
-            po["yesEntryPrice"] = p.yes_entry_price;
-            po["noEntryPrice"] = p.no_entry_price;
-            po["yesSize"] = p.size_shares;
-            po["noSize"] = p.size_shares;
-            po["yesCost"] = p.yes_entry_price * p.size_shares;
-            po["noCost"] = p.no_entry_price * p.size_shares;
-            po["yesLivePrice"] = token_mark(p.yes_token_id);
-            po["noLivePrice"] = token_mark(p.no_token_id);
-            po["yesBuyPrice"] = token_buy(p.yes_token_id);
-            po["noBuyPrice"] = token_buy(p.no_token_id);
-            po["entryFee"] = compute_dh_entry_fee_per_share(
-                p.yes_entry_price, p.no_entry_price, p.yes_token_id, p.no_token_id) * p.size_shares;
-            const double yes_bid = po["yesLivePrice"].as_double();
-            const double no_bid = po["noLivePrice"].as_double();
-            if (yes_bid > 0.0 && no_bid > 0.0) {
-                const double gross = (yes_bid + no_bid) * p.size_shares;
-                const double exit_fee = gross * fee_rate_;
-                const double entry_fee = po["entryFee"].as_double();
-                po["pnl"] = gross - exit_fee - p.combined_cost_usdc - entry_fee;
-            } else {
-                po["pnl"] = 0.0;
-            }
-            po["lockedPnl"] = p.locked_profit_usdc;
-            pos_arr.push_back(po);
-        }
         for (const auto& [id, p] : risk_manager_->get_open_lih_positions()) {
             if (!paper_mode_ && (p.paper_mode || p.is_shadow)) continue;
             boost::json::object po;
@@ -714,38 +651,6 @@ std::string StateStore::get_dashboard_json() const {
             push_hist({p.closed_at.value_or(p.opened_at), std::move(h)});
         }
 
-        for (const auto& p : risk_manager_->get_closed_dh_positions()) {
-            const double ts = p.closed_at.value_or(p.opened_at);
-            if (!after_baseline(ts)) continue;
-            boost::json::object h;
-            h["id"] = p.dh_id.c_str();
-            h["strategy"] = "DH";
-            h["asset"] = p.asset.c_str();
-            h["status"] = "closed";
-            h["market"] = p.market_question.c_str();
-            h["side"] = "BOTH";
-            h["direction"] = "HEDGE";
-            h["entryPrice"] = p.combined_entry_price;
-            h["exitPrice"] = p.yes_exit_price.value_or(0.0) + p.no_exit_price.value_or(0.0);
-            h["yesEntryPrice"] = p.yes_entry_price;
-            h["noEntryPrice"] = p.no_entry_price;
-            h["yesExitPrice"] = p.yes_exit_price.value_or(0.0);
-            h["noExitPrice"] = p.no_exit_price.value_or(0.0);
-            h["size"] = p.size_shares;
-            h["costUsdc"] = p.combined_cost_usdc;
-            h["entryFee"] = p.combined_cost_usdc * fr;
-            double gross = (p.yes_exit_price.value_or(0.0) + p.no_exit_price.value_or(0.0)) * p.size_shares;
-            h["exitFee"] = gross * fr;
-            h["lockedProfit"] = p.locked_profit_usdc;
-            h["pnlUsdc"] = p.pnl_usdc.value_or(0.0);
-            h["openedAt"] = p.opened_at;
-            h["closedAt"] = p.closed_at.value_or(0.0);
-            h["exitReason"] = p.exit_reason.c_str();
-            h["isPaperMode"] = p.paper_mode;
-            h["windowMinutes"] = p.window_minutes;
-            push_hist({p.closed_at.value_or(p.opened_at), std::move(h)});
-        }
-
         for (const auto& p : risk_manager_->get_closed_lih_positions()) {
             if (p.is_shadow) continue;
             const double ts = p.closed_at.value_or(p.opened_at);
@@ -811,34 +716,6 @@ std::string StateStore::get_dashboard_json() const {
             h["exitReason"] = "";
             h["isPaperMode"] = p.paper_mode;
             if (live) h["exitPrice"] = live->price;
-            push_hist({p.opened_at, std::move(h)});
-        }
-
-        for (const auto& [id, p] : risk_manager_->get_open_dh_positions()) {
-            if (!after_baseline(p.opened_at)) continue;
-            boost::json::object h;
-            h["id"] = id.c_str();
-            h["strategy"] = "DH";
-            h["asset"] = p.asset.c_str();
-            h["status"] = "open";
-            h["market"] = p.market_question.c_str();
-            h["side"] = "BOTH";
-            h["direction"] = "HEDGE";
-            h["entryPrice"] = p.combined_entry_price;
-            h["yesEntryPrice"] = p.yes_entry_price;
-            h["noEntryPrice"] = p.no_entry_price;
-            h["size"] = p.size_shares;
-            h["costUsdc"] = p.combined_cost_usdc;
-            h["entryFee"] = p.combined_cost_usdc * fr;
-            h["exitFee"] = 0.0;
-            h["lockedProfit"] = p.locked_profit_usdc;
-            h["pnlUsdc"] = p.locked_profit_usdc;
-            h["openedAt"] = p.opened_at;
-            h["closedAt"] = 0.0;
-            h["endDateTs"] = p.end_date_ts;
-            h["exitReason"] = "";
-            h["isPaperMode"] = p.paper_mode;
-            h["windowMinutes"] = p.window_minutes;
             push_hist({p.opened_at, std::move(h)});
         }
 

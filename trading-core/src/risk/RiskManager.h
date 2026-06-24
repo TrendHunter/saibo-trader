@@ -43,34 +43,6 @@ struct Position {
     bool is_neg_risk = false; // true for Polymarket Up/Down (neg-risk) markets
 };
 
-struct DumpHedgePosition {
-    std::string dh_id;
-    std::string yes_order_id;
-    std::string no_order_id;
-    std::string yes_token_id;
-    std::string no_token_id;
-    std::string market_question;
-    std::string asset;
-    double yes_entry_price;
-    double no_entry_price;
-    double combined_entry_price;
-    double size_shares;
-    double combined_cost_usdc;
-    double locked_profit_usdc;
-    double opened_at;
-    double end_date_ts = 0.0;
-    bool paper_mode = true;
-    std::string strategy = "DH";
-    std::optional<double> closed_at;
-    std::optional<double> yes_exit_price;
-    std::optional<double> no_exit_price;
-    std::optional<double> pnl_usdc;
-    std::string exit_reason;
-    bool is_neg_risk = false; // true for Polymarket Up/Down (neg-risk) markets
-    int window_minutes = 5;   // 5 or 15 — Polymarket up/down series
-    std::string condition_id; // 0x hex — for on-chain redeem after resolution
-};
-
 struct LegInHedgePosition {
     std::string lih_id;
     std::string asset;
@@ -130,9 +102,7 @@ public:
     double get_min_order_size() const;
     
     double get_la_pnl() const;
-    double get_dh_pnl() const;
     int get_total_trades() const;
-    int get_total_dh_trades() const;
     int get_total_lih_trades() const;
     int get_winning_trades() const;
 
@@ -145,17 +115,6 @@ public:
     std::optional<Position> register_trade_close(
         const std::string& order_id,
         double exit_price,
-        std::optional<double> exit_timestamp = std::nullopt,
-        std::optional<double> actual_proceeds_usdc = std::nullopt
-    );
-
-    std::pair<bool, std::string> can_open_dh_position(double combined_cost_usdc);
-    void register_dh_open(const DumpHedgePosition& position);
-    std::optional<DumpHedgePosition> register_dh_close(
-        const std::string& dh_id,
-        double yes_exit_price,
-        double no_exit_price,
-        const std::string& exit_reason = "",
         std::optional<double> exit_timestamp = std::nullopt,
         std::optional<double> actual_proceeds_usdc = std::nullopt
     );
@@ -243,9 +202,7 @@ public:
     void reconcile_paper_balance(bool reset_trading_halt = false);
 
     std::unordered_map<std::string, Position> get_open_positions() const;
-    std::unordered_map<std::string, DumpHedgePosition> get_open_dh_positions() const;
     std::vector<Position> get_closed_positions() const;
-    std::vector<DumpHedgePosition> get_closed_dh_positions() const;
     std::vector<LegInHedgePosition> get_closed_lih_positions() const;
     double get_lih_pnl() const;
 
@@ -316,9 +273,6 @@ private:
     std::unordered_map<std::string, Position> open_positions_;
     std::vector<Position> closed_positions_;
 
-    std::unordered_map<std::string, DumpHedgePosition> open_dh_positions_;
-    std::vector<DumpHedgePosition> closed_dh_positions_;
-
     std::unordered_map<std::string, LegInHedgePosition> open_lih_positions_;
     std::unordered_set<std::string> lih_leg1_inflight_;
     std::unordered_map<std::string, double> lih_leg1_inflight_since_;
@@ -330,16 +284,13 @@ private:
     int total_trades_ = 0;
     int winning_trades_ = 0;
     double total_pnl_ = 0.0;
-    int total_dh_trades_ = 0;
     double la_pnl_ = 0.0;
-    double dh_pnl_ = 0.0;
 
     std::unordered_map<std::string, int> asset_trades_;
     std::unordered_map<std::string, int> asset_wins_;
     std::unordered_map<std::string, double> asset_pnl_;
 
     std::deque<double> recent_la_pnls_;
-    std::deque<double> recent_dh_pnls_;
     int circuit_breaker_window_;
     double circuit_breaker_resume_at_ = 0.0;
     double fee_rate_ = 0.018;

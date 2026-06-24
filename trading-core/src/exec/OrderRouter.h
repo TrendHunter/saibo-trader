@@ -58,7 +58,6 @@ public:
                 const std::string& api_secret = "",
                 const std::string& api_passphrase = "",
                 const std::string& neg_risk_exchange = "",
-                bool live_dh_dry_run = false,
                 bool live_lih_dry_run = true,
                 bool use_python_clob = false,
                 const std::string& clob_bridge_host = "127.0.0.1",
@@ -91,9 +90,6 @@ public:
     // Sum of ask sizes at or below price * 1.02; -1 on fetch/parse failure.
     double query_ask_depth_shares(const std::string& token_id, double price);
 
-    // Returns true if a DH position was opened (paper or live).
-    bool submit_dump_hedge_order(const DumpHedgeSignal& signal, double size_shares);
-
     void submit_close_order(const std::string& order_id, const std::string& token_id, double current_price, double size, const std::string& asset, const std::string& question, double end_date_ts, const std::string& strategy, bool is_neg_risk = false);
 
 private:
@@ -107,7 +103,6 @@ private:
     std::string signer_address_;
     std::string funder_address_;
     bool paper_mode_;
-    bool live_dh_dry_run_;
     bool live_lih_dry_run_;
     std::string api_key_;
     std::string api_secret_;
@@ -181,7 +176,7 @@ private:
         uint8_t side = 0
     );
 
-    // When register_position=false, sends to CLOB only (used for DH legs / unwind).
+    // When register_position=false, sends to CLOB only (used for LIH legs / unwind).
     LegFillResult execute_rest_order(
         const Order& order,
         const Signature& sig,
@@ -196,7 +191,7 @@ private:
 
     bool simulate_paper_order(const Order& order, const Signature& sig, const std::string& asset = "", const std::string& question = "", double end_date_ts = 0.0, const std::string& strategy = "MANUAL", const std::string& original_order_id = "", bool is_neg_risk = false, const std::string& direction = "");
 
-    LegFillResult execute_dh_leg_buy(const std::string& token_id, double price, double size_shares, bool is_neg_risk);
+    LegFillResult execute_leg_buy(const std::string& token_id, double price, double size_shares, bool is_neg_risk);
     LegFillResult execute_unwind_sell(const std::string& token_id, double price, double size_shares, bool is_neg_risk);
 
     std::optional<boost::json::object> fetch_book_object(const std::string& token_id);

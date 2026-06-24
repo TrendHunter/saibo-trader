@@ -33,18 +33,6 @@ public:
     bool is_paper_mode() const { return paper_mode_; }
     void set_fee_rate(double rate) { fee_rate_ = rate; }
     void set_strategy(std::string s) { strategy_ = std::move(s); }
-    void set_dh_config(double sum_target, double min_discount) {
-        dh_sum_target_ = sum_target;
-        dh_min_discount_ = min_discount;
-    }
-    void set_dh_timing(double cooldown_seconds, double min_seconds_remaining) {
-        dh_cooldown_seconds_ = cooldown_seconds;
-        dh_min_seconds_remaining_ = min_seconds_remaining;
-    }
-    double get_dh_sum_target() const { return dh_sum_target_; }
-    double get_dh_min_discount() const { return dh_min_discount_; }
-    double get_dh_cooldown_seconds() const { return dh_cooldown_seconds_; }
-    double get_dh_min_seconds_remaining() const { return dh_min_seconds_remaining_; }
     void set_dh_window_enabled(bool enable_5m, bool enable_15m) {
         dh_enable_5m_ = enable_5m;
         dh_enable_15m_ = enable_15m;
@@ -62,9 +50,6 @@ public:
     };
     void set_token_fee_params(const std::string& token_id, double rate, double exponent);
     TokenFeeParams get_token_fee_params(std::string_view token_id) const;
-    double compute_dh_entry_fee_per_share(
-        double yes_price, double no_price,
-        const std::string& yes_token_id, const std::string& no_token_id) const;
 
     void update_btc_price(const PriceTick& tick);
     std::optional<PriceTick> get_latest_btc_price() const;
@@ -162,8 +147,6 @@ public:
 
     void set_lih_enabled(bool v) { lih_enabled_ = v; }
     bool lih_enabled() const { return lih_enabled_; }
-    void set_lih_disable_dh(bool v) { lih_disable_dh_ = v; }
-    bool lih_disable_dh() const { return lih_disable_dh_; }
     bool lih_use_mirror() const { return lih_use_mirror_; }
     void set_lih_config(double leg1_max, double target_combined, bool use_mirror) {
         lih_leg1_max_price_ = leg1_max;
@@ -173,9 +156,12 @@ public:
     double lih_leg1_max_price() const { return lih_leg1_max_price_; }
     double lih_target_combined() const { return lih_target_combined_; }
     void set_lih_leg1_mode(const std::string& mode) { lih_leg1_mode_ = mode; }
-    bool lih_leg1_trend_mode() const { return lih_leg1_mode_ == "trend"; }
+    bool lih_leg1_trend_mode() const { return lih_leg1_mode_ == "trend" || lih_leg1_mode_ == "expensive"; }
+    bool lih_leg1_trigger_mode() const { return lih_leg1_mode_ == "trigger"; }
     void set_lih_leg1_trend_max_price(double v) { lih_leg1_trend_max_price_ = v; }
     double lih_leg1_trend_max_price() const { return lih_leg1_trend_max_price_; }
+    void set_lih_leg1_trigger_min(double v) { lih_leg1_trigger_min_ = v; }
+    double lih_leg1_trigger_min() const { return lih_leg1_trigger_min_; }
     void set_live_lih_dry_run(bool v) { live_lih_dry_run_ = v; }
     bool live_lih_dry_run() const { return live_lih_dry_run_; }
     void set_trades_baseline_ts(double ts) { trades_baseline_ts_ = ts; }
@@ -189,10 +175,6 @@ private:
     bool paper_mode_ = true;
     double fee_rate_ = 0.018;
     std::string strategy_ = "leg_in";
-    double dh_sum_target_ = 0.95;
-    double dh_min_discount_ = 0.02;
-    double dh_cooldown_seconds_ = 30.0;
-    double dh_min_seconds_remaining_ = 60.0;
     bool dh_enable_5m_ = true;
     bool dh_enable_15m_ = true;
     bool dh_5m_btc_ = true;
@@ -214,11 +196,11 @@ private:
     double paper_hedge_extra_slip_pct_ = 0.0;
     double paper_force_extra_slip_pct_ = 0.0;
     bool lih_enabled_ = true;
-    bool lih_disable_dh_ = false;
     double lih_leg1_max_price_ = 0.45;
     double lih_target_combined_ = 0.94;
     std::string lih_leg1_mode_ = "cheap";
     double lih_leg1_trend_max_price_ = 0.65;
+    double lih_leg1_trigger_min_ = 0.70;
     bool lih_use_mirror_ = true;
     bool live_lih_dry_run_ = true;
     double trades_baseline_ts_ = 0.0;

@@ -23,18 +23,4 @@ struct MarketInfo {
     bool is_neg_risk = false;
 };
 
-struct DumpHedgeSignal {
-    MarketInfo market;
-    std::string asset;
-    std::string yes_token_id;
-    std::string no_token_id;
-    double yes_price;
-    double no_price;
-    double combined_price;
-    double discount;
-    double discount_pct;
-    double seconds_remaining;
-    double timestamp;
-};
-
 } // namespace trading

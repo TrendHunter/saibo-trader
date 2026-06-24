@@ -11,7 +11,7 @@
 namespace trading {
 
 struct LegInAction {
-    enum class Kind { OpenLeg1, CompleteHedge, HeavyDilute, ScalePaired, DilutePaired } kind;
+    enum class Kind { OpenLeg1, CompleteHedge } kind;
     MarketInfo market;
     bool buy_yes = false;
     double price = 0.0;
@@ -42,6 +42,8 @@ public:
                        double trend_lookback_sec = 60.0,
                        bool leg1_trend_mode = false,
                        double leg1_trend_max_price = 0.65,
+                       bool leg1_trigger_mode = false,
+                       double leg1_trigger_min = 0.70,
                        double endgame_secs = 100.0,
                        double endgame_hold_ask = 0.90,
                        double endgame_resume_hedge_ask = 0.89,
@@ -50,7 +52,14 @@ public:
                        double endgame_step_large = 10.0,
                        double endgame_gap_large = 10.0,
                        double endgame_override_secs = 50.0,
-                       double endgame_override_cooldown = 2.0);
+                       double endgame_override_cooldown = 2.0,
+                       bool endgame_minimize_gap = true,
+                       bool endgame_ladder_enabled = true,
+                       double endgame_ladder_secs = 90.0,
+                       double endgame_ladder_start = 0.95,
+                       double endgame_ladder_end = 0.97,
+                       double endgame_ladder_step = 0.01,
+                       double max_entry_marginal = 1.15);
 
     std::optional<LegInAction> evaluate(double now_ms, risk::RiskManager& rm);
 
@@ -73,13 +82,18 @@ public:
     void set_flex_dilute_ratio(double v) { flex_dilute_ratio_ = v; }
     void set_leg1_trend_align(bool v) { leg1_trend_align_ = v; }
     void set_trend_lookback_sec(double v) { trend_lookback_sec_ = v; }
-    void set_leg1_trend_mode(bool v) { leg1_trend_mode_ = v; }
+    void set_leg1_trend_mode(bool v) { leg1_trend_mode_ = v; leg1_trigger_mode_ = false; }
     void set_leg1_trend_max_price(double v) { leg1_trend_max_price_ = v; }
+    void set_leg1_trigger_mode(bool v) { leg1_trigger_mode_ = v; if (v) leg1_trend_mode_ = false; }
+    void set_leg1_trigger_min(double v) { leg1_trigger_min_ = v; }
     void set_endgame_secs(double v) { endgame_secs_ = v; }
     void set_endgame_hold_ask(double v) { endgame_hold_ask_ = v; }
     void set_endgame_resume_hedge_ask(double v) { endgame_resume_hedge_ask_ = v; }
     void set_endgame_soft_cap(double v) { endgame_soft_cap_ = v; }
     void set_endgame_override_secs(double v) { endgame_override_secs_ = v; }
+    void set_endgame_minimize_gap(bool v) { endgame_minimize_gap_ = v; }
+    void set_endgame_ladder_enabled(bool v) { endgame_ladder_enabled_ = v; }
+    void set_max_entry_marginal(double v) { max_entry_marginal_ = v; }
 
 private:
     bool leg1_trend_allows(const MarketInfo& market, bool pick_yes) const;
@@ -107,6 +121,8 @@ private:
                               double yes_avg, double no_avg, double gap) const;
     void log_entry_status(const MarketInfo& market, const std::string& key, double now_sec,
                           const Quote& q, const char* reason) const;
+    /** Time-ramped max marginal in endgame ladder window (e.g. 0.95 → 0.97 over 90s). */
+    double endgame_ladder_max_marginal(double secs_left) const;
 
     StateStore& store_;
     std::vector<MarketInfo> markets_;
@@ -130,6 +146,9 @@ private:
     double trend_lookback_sec_;
     bool leg1_trend_mode_;
     double leg1_trend_max_price_;
+    /** Shadow-style: enter when either side ask >= trigger_min (pick higher ask). */
+    bool leg1_trigger_mode_;
+    double leg1_trigger_min_;
     double endgame_secs_;
     double endgame_hold_ask_;
     double endgame_resume_hedge_ask_;
@@ -139,6 +158,15 @@ private:
     double endgame_gap_large_;
     double endgame_override_secs_;
     double endgame_override_cooldown_;
+    /** When true, skip endgame hold — always try 5/10-step gap shrink in endgame. */
+    bool endgame_minimize_gap_;
+    bool endgame_ladder_enabled_;
+    double endgame_ladder_secs_;
+    double endgame_ladder_start_;
+    double endgame_ladder_end_;
+    double endgame_ladder_step_;
+    /** Skip leg1 when leg1_ask + opposite_ask exceeds this (0 = disabled). */
+    double max_entry_marginal_;
     mutable std::unordered_map<std::string, double> last_status_log_sec_;
     std::unordered_map<std::string, double> last_leg1_time_;
     std::unordered_map<std::string, double> last_rebalance_time_;

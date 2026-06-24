@@ -15,6 +15,7 @@ RUNTIME_CONFIG_PATH = Path(os.getenv("RUNTIME_CONFIG_PATH", "logs/runtime_config
 
 BOOL_KEYS = frozenset({
     "BINANCE_FEED_ENABLED",
+    "BOOK_AWARE_DETECT",
     "DH_ENABLE_5M",
     "DH_ENABLE_15M",
     "DH_ENABLE_5M_BTC",
@@ -22,19 +23,17 @@ BOOL_KEYS = frozenset({
     "DH_ENABLE_5M_SOL",
     "DH_ENABLE_15M_BTC",
     "DH_ENABLE_15M_ETH",
-    "LIH_ENABLED",
-    "LIH_DISABLE_DH",
     "LIH_USE_MIRROR",
     "LIVE_LIH_DRY_RUN",
     "LIH_ALLOW_OVER_TARGET",
     "LIH_ONE_SLOT_GLOBAL",
+    "LIH_LEG1_TREND_ALIGN",
+    "LIH_ENDGAME_MINIMIZE_GAP",
+    "LIH_ENDGAME_LADDER_ENABLED",
 })
 
 ALLOWED_KEYS = {
-    "DH_SUM_TARGET",
-    "DH_MIN_DISCOUNT",
-    "DH_COOLDOWN_SECONDS",
-    "DH_MIN_SECONDS_REMAINING",
+    "BOOK_AWARE_DETECT",
     "DH_ENABLE_5M",
     "DH_ENABLE_15M",
     "DH_ENABLE_5M_BTC",
@@ -42,11 +41,21 @@ ALLOWED_KEYS = {
     "DH_ENABLE_5M_SOL",
     "DH_ENABLE_15M_BTC",
     "DH_ENABLE_15M_ETH",
-    "LIH_ENABLED",
-    "LIH_DISABLE_DH",
     "LIH_USE_MIRROR",
     "LIVE_LIH_DRY_RUN",
     "LIH_LEG1_MAX_PRICE",
+    "LIH_LEG1_MODE",
+    "LIH_LEG1_TRIGGER_MIN",
+    "LIH_LEG1_START_DELAY_SEC",
+    "LIH_LEG1_TREND_ALIGN",
+    "LIH_ENDGAME_SOFT_CAP",
+    "LIH_ENDGAME_OVERRIDE_SECS",
+    "LIH_ENDGAME_MINIMIZE_GAP",
+    "LIH_ENDGAME_LADDER_ENABLED",
+    "LIH_ENDGAME_LADDER_SECS",
+    "LIH_ENDGAME_LADDER_START",
+    "LIH_ENDGAME_LADDER_END",
+    "LIH_MAX_ENTRY_MARGINAL",
     "LIH_TARGET_COMBINED",
     "LIH_MIN_SECONDS_REMAINING",
     "LIH_LEG1_MIN_SECONDS_REMAINING",
@@ -161,10 +170,6 @@ def _validate_patch(patch: dict[str, Any]) -> dict[str, str]:
                 raise ValueError("RISK_MAX_CONCURRENT_POSITIONS must be 0-50 (0 = no new leg1, rebalance only)")
             text = str(n)
         elif key.startswith("RISK_") or key in (
-            "DH_SUM_TARGET",
-            "DH_MIN_DISCOUNT",
-            "DH_COOLDOWN_SECONDS",
-            "DH_MIN_SECONDS_REMAINING",
             "LIH_LEG1_MAX_PRICE",
             "LIH_TARGET_COMBINED",
             "LIH_MIN_SECONDS_REMAINING",
@@ -188,15 +193,9 @@ def _validate_patch(patch: dict[str, Any]) -> dict[str, str]:
                 raise ValueError("RISK_DAILY_LOSS_LIMIT must be 0.01-1.0")
             if key == "RISK_TOTAL_DRAWDOWN_KILL" and not (0.05 <= num <= 1.0):
                 raise ValueError("RISK_TOTAL_DRAWDOWN_KILL must be 0.05-1.0")
-            if key == "DH_SUM_TARGET" and not (0.5 <= num <= 1.0):
-                raise ValueError("DH_SUM_TARGET must be 0.5-1.0")
-            if key == "DH_MIN_DISCOUNT" and not (0.0 <= num <= 0.5):
-                raise ValueError("DH_MIN_DISCOUNT must be 0.0-0.5")
             if key == "FEE_RATE" and not (0.0 <= num <= 0.1):
                 raise ValueError("FEE_RATE must be 0.0-0.1")
             if key in (
-                "DH_COOLDOWN_SECONDS",
-                "DH_MIN_SECONDS_REMAINING",
                 "LIH_COOLDOWN_SECONDS",
                 "LIH_LEG1_COOLDOWN_SECONDS",
                 "LIH_REBALANCE_COOLDOWN_SECONDS",

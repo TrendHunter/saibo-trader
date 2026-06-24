@@ -19,8 +19,16 @@ docker-compose.override.yml
 logs/
 bot.log
 bridge.log
+serverbot.log
+*.log
+!logs/.gitkeep
+deploy_live_only.log
+watch_round.log
+backup/*.zip
 
 # Frontend build artifacts (see frontend/.gitignore)
 frontend/node_modules/
 frontend/.next/
 frontend/prisma/data/
+
+_ref_polyeth5m/

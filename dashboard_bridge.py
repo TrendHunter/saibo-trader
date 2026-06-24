@@ -158,20 +158,12 @@ def _print_startup_banner() -> None:
             file=sys.stderr,
         )
     if cfg:
-        lih = cfg.get("LIH_ENABLED", "true").lower() not in ("false", "0", "no", "off")
-        if lih:
-            print(
-                f"   LIH leg1≤{cfg.get('LIH_LEG1_MAX_PRICE', '?')}  "
-                f"target={cfg.get('LIH_TARGET_COMBINED', '?')}  "
-                f"5m={cfg.get('DH_ENABLE_5M', '?')}  15m={cfg.get('DH_ENABLE_15M', '?')}",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"   DH sum≤{cfg.get('DH_SUM_TARGET', '?')}  "
-                f"5m={cfg.get('DH_ENABLE_5M', '?')}  15m={cfg.get('DH_ENABLE_15M', '?')}",
-                file=sys.stderr,
-            )
+        print(
+            f"   LIH mode={cfg.get('LIH_LEG1_MODE', 'trigger')}  "
+            f"target={cfg.get('LIH_TARGET_COMBINED', '?')}  "
+            f"5m={cfg.get('DH_ENABLE_5M', '?')}  15m={cfg.get('DH_ENABLE_15M', '?')}",
+            file=sys.stderr,
+        )
     print("", file=sys.stderr)
 
 

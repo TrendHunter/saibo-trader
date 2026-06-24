@@ -286,10 +286,7 @@ export function PmMarketPanel({
           </div>
         </div>
         <p className="text-[11px] text-muted-foreground mt-2 leading-relaxed">
-          YES+NO 卖一合价。
-          {lihMode
-            ? ` LIH 关注单腿低价与 rebalance 至 ≤ ${combinedTarget.toFixed(2)}。`
-            : ` 5m / 15m 参与 DH 开仓（净折扣 ≥ ${(dhMinDiscount * 100).toFixed(1)}% 且合价 ≤ ${dhSumTarget}）。`}
+          YES+NO 卖一合价。LIH 利润对冲与末段参考合价 ≤ {combinedTarget.toFixed(2)}。
         </p>
       </CardHeader>
       <CardContent className="space-y-5">

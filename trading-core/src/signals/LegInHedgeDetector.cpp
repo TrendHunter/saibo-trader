@@ -35,6 +35,8 @@ LegInHedgeDetector::LegInHedgeDetector(StateStore& store,
                                        double trend_lookback_sec,
                                        bool leg1_trend_mode,
                                        double leg1_trend_max_price,
+                                       bool leg1_trigger_mode,
+                                       double leg1_trigger_min,
                                        double endgame_secs,
                                        double endgame_hold_ask,
                                        double endgame_resume_hedge_ask,
@@ -43,7 +45,14 @@ LegInHedgeDetector::LegInHedgeDetector(StateStore& store,
                                        double endgame_step_large,
                                        double endgame_gap_large,
                                        double endgame_override_secs,
-                                       double endgame_override_cooldown)
+                                       double endgame_override_cooldown,
+                                       bool endgame_minimize_gap,
+                                       bool endgame_ladder_enabled,
+                                       double endgame_ladder_secs,
+                                       double endgame_ladder_start,
+                                       double endgame_ladder_end,
+                                       double endgame_ladder_step,
+                                       double max_entry_marginal)
     : store_(store),
       markets_(std::move(markets)),
       leg1_max_price_(leg1_max_price),
@@ -64,6 +73,8 @@ LegInHedgeDetector::LegInHedgeDetector(StateStore& store,
       trend_lookback_sec_(trend_lookback_sec),
       leg1_trend_mode_(leg1_trend_mode),
       leg1_trend_max_price_(leg1_trend_max_price),
+      leg1_trigger_mode_(leg1_trigger_mode),
+      leg1_trigger_min_(leg1_trigger_min),
       endgame_secs_(endgame_secs),
       endgame_hold_ask_(endgame_hold_ask),
       endgame_resume_hedge_ask_(endgame_resume_hedge_ask),
@@ -72,7 +83,14 @@ LegInHedgeDetector::LegInHedgeDetector(StateStore& store,
       endgame_step_large_(endgame_step_large),
       endgame_gap_large_(endgame_gap_large),
       endgame_override_secs_(endgame_override_secs),
-      endgame_override_cooldown_(endgame_override_cooldown) {}
+      endgame_override_cooldown_(endgame_override_cooldown),
+      endgame_minimize_gap_(endgame_minimize_gap),
+      endgame_ladder_enabled_(endgame_ladder_enabled),
+      endgame_ladder_secs_(endgame_ladder_secs),
+      endgame_ladder_start_(endgame_ladder_start),
+      endgame_ladder_end_(endgame_ladder_end),
+      endgame_ladder_step_(endgame_ladder_step),
+      max_entry_marginal_(max_entry_marginal) {}
 
 bool LegInHedgeDetector::spot_trend_favors(const MarketInfo& market, bool pick_yes) const {
     const std::string asset = market.asset;
@@ -253,6 +271,27 @@ void LegInHedgeDetector::log_entry_status(
     store_.push_telemetry(msg);
 }
 
+double LegInHedgeDetector::endgame_ladder_max_marginal(double secs_left) const {
+    if (!endgame_ladder_enabled_ || endgame_ladder_secs_ <= kFloatTol) {
+        return endgame_soft_cap_;
+    }
+    if (secs_left > endgame_ladder_secs_ + kFloatTol) {
+        return target_combined_;
+    }
+    const double step = endgame_ladder_step_ > kFloatTol ? endgame_ladder_step_ : 0.01;
+    const double start = std::max(endgame_ladder_start_, target_combined_ + step);
+    const double end = std::min(endgame_ladder_end_, endgame_soft_cap_);
+    if (end <= target_combined_ + kFloatTol) return target_combined_;
+
+    const double elapsed = endgame_ladder_secs_ - secs_left;
+    const double progress = std::clamp(elapsed / endgame_ladder_secs_, 0.0, 1.0);
+    const int n_steps = static_cast<int>(std::round((end - start) / step));
+    const int tier = static_cast<int>(
+        std::floor(progress * static_cast<double>(n_steps + 1)));
+    const int capped_tier = std::min(tier, n_steps);
+    return std::min(start + capped_tier * step, end);
+}
+
 std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::RiskManager& rm) {
     const double now_sec = now_ms / 1000.0;
     rm.scrub_lih_inflight_locks(now_sec);
@@ -267,15 +306,6 @@ std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::Ris
         const double secs_left = market.end_date_ts - now_sec;
 
         const std::string key = market.asset + "-" + std::to_string(market.window_minutes);
-
-        bool blocked = false;
-        for (const auto& [id, dh] : rm.get_open_dh_positions()) {
-            if (dh.asset == market.asset) {
-                blocked = true;
-                break;
-            }
-        }
-            if (blocked) continue;
 
         auto open_lih = rm.find_open_lih_for_market(market);
         if (!open_lih) {
@@ -326,7 +356,16 @@ std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::Ris
             bool pick_yes = false;
             const char* entry_tag = "entry";
 
-            if (leg1_trend_mode_) {
+            if (leg1_trigger_mode_) {
+                const bool yes_hit = q.yes >= leg1_trigger_min_ - kFloatTol;
+                const bool no_hit = q.no >= leg1_trigger_min_ - kFloatTol;
+                if (!yes_hit && !no_hit) {
+                    log_entry_status(market, key, now_sec, q, "below trigger");
+                    continue;
+                }
+                pick_yes = yes_hit && (!no_hit || q.yes >= q.no);
+                entry_tag = q.from_mirror ? "mirror-trigger" : "trigger-entry";
+            } else if (leg1_trend_mode_) {
                 const bool yes_trend = spot_trend_favors(market, true);
                 const bool no_trend = spot_trend_favors(market, false);
                 if (yes_trend && no_trend) {
@@ -375,6 +414,18 @@ std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::Ris
             }
             if (shares * px + kFloatTol < kLegMinUsdc) {
                 log_entry_status(market, key, now_sec, q, "below min usdc");
+                continue;
+            }
+
+            const double opposite_px = pick_yes ? q.no : q.yes;
+            const double entry_marginal = px + opposite_px;
+            if (max_entry_marginal_ > kFloatTol &&
+                entry_marginal > max_entry_marginal_ + kFloatTol) {
+                log_entry_status(market, key, now_sec, q, "entry marginal too wide");
+                spdlog::info(
+                    "[LIH DEBUG] entry-skip | {} {}m | leg1 {:.4f} opp {:.4f} marginal {:.4f} > {:.2f}",
+                    market.asset, market.window_minutes, px, opposite_px, entry_marginal,
+                    max_entry_marginal_);
                 continue;
             }
 
@@ -464,33 +515,43 @@ std::optional<LegInAction> LegInHedgeDetector::evaluate(double now_ms, risk::Ris
             };
 
             if (in_endgame) {
-                const bool on_trend = spot_trend_favors(market, heavy_yes);
-                // Hold only when clearly winning (≥ hold ask) and on-trend; < resume ask always hedge.
-                const bool hold_win = heavy_ask >= endgame_hold_ask_ - kFloatTol
-                    && heavy_ask > endgame_resume_hedge_ask_ + kFloatTol
-                    && on_trend;
-                if (hold_win) {
-                    std::string msg = fmt::format(
-                        "[LIH DEBUG] endgame-hold | {} {}m | heavy {:.4f} on-trend | {:.0f}s left — skip hedge",
-                        market.asset, market.window_minutes, heavy_ask, secs_left);
-                    spdlog::info(msg);
-                    store_.push_telemetry(msg);
-                    continue;
+                if (!endgame_minimize_gap_) {
+                    const bool on_trend = spot_trend_favors(market, heavy_yes);
+                    const bool hold_win = heavy_ask >= endgame_hold_ask_ - kFloatTol
+                        && heavy_ask > endgame_resume_hedge_ask_ + kFloatTol
+                        && on_trend;
+                    if (hold_win) {
+                        std::string msg = fmt::format(
+                            "[LIH DEBUG] endgame-hold | {} {}m | heavy {:.4f} on-trend | {:.0f}s left — skip hedge",
+                            market.asset, market.window_minutes, heavy_ask, secs_left);
+                        spdlog::info(msg);
+                        store_.push_telemetry(msg);
+                        continue;
+                    }
                 }
 
                 const double step = gap >= endgame_gap_large_ - kFloatTol
                     ? endgame_step_large_ : endgame_step_small_;
-                const char* mode = endgame_override ? "endgame-override" : "endgame";
+                const double ladder_max = endgame_ladder_max_marginal(secs_left);
+                const double abs_max = endgame_ladder_enabled_
+                    ? std::min(endgame_ladder_end_, endgame_soft_cap_)
+                    : endgame_soft_cap_;
+                const bool can_profit = at_target;
+                const bool can_ladder = endgame_ladder_enabled_
+                    && secs_left <= endgame_ladder_secs_ + kFloatTol
+                    && marginal <= ladder_max + kFloatTol;
+                const bool can_soft = !endgame_ladder_enabled_
+                    && marginal <= endgame_soft_cap_ + kFloatTol;
+                const bool can_override = endgame_override
+                    && marginal <= abs_max + kFloatTol;
+                if (!can_profit && !can_ladder && !can_soft && !can_override) continue;
 
-                if (at_target) {
-                    if (auto act = try_light_hedge(step, false, mode)) return act;
-                    continue;
-                }
-
-                const bool within_soft_cap = marginal <= endgame_soft_cap_ + kFloatTol;
-                if (within_soft_cap || endgame_override) {
-                    if (auto act = try_light_hedge(step, false, mode)) return act;
-                }
+                std::string mode_str = endgame_override ? "endgame-override"
+                    : (can_profit ? "endgame-profit"
+                        : (can_ladder
+                            ? fmt::format("endgame-ladder@{:.2f}", ladder_max)
+                            : "endgame-gap"));
+                if (auto act = try_light_hedge(step, false, mode_str.c_str())) return act;
                 continue;
             }
 

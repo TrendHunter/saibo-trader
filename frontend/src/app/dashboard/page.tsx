@@ -151,16 +151,7 @@ export default function DashboardPage() {
         </div>
 
         <div className="rounded-lg border border-violet-500/20 bg-violet-500/8 px-4 py-2.5 text-[13px] text-violet-100/90">
-          {lihMode ? (
-            <>
-              <strong>LIH 模式</strong> — 先买便宜腿（≤ {liveState.lihLeg1MaxPrice.toFixed(2)}），再 rebalance / 对冲至合价 ≤{" "}
-              {liveState.lihTargetCombined.toFixed(2)}。
-            </>
-          ) : (
-            <>
-              <strong>DH 模式</strong> — 开仓看 YES+NO 合价（目标 ≤ {liveState.dhSumTarget.toFixed(2)}）。
-            </>
-          )}
+          <strong>LIH</strong> — trigger leg1 + 利润对冲（合价 ≤ {liveState.lihTargetCombined.toFixed(2)}），末段阶梯缩 gap。
         </div>
 
         <TradingPanels liveState={liveState} />

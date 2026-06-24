@@ -35,9 +35,8 @@ def _enabled_assets(prefix: str, assets: tuple[str, ...]) -> str:
 
 def print_config_summary() -> None:
     load_dotenv()
-    lih = _env_bool("LIH_ENABLED", True)
     mode = "实盘 LIVE"
-    strategy = "LIH 分腿对冲" if lih else "DH 结构对冲（遗留）"
+    strategy = "LIH 分腿对冲"
 
     print("=" * 60)
     print(f"  运行配置摘要  |  {mode}  |  {strategy}")
@@ -47,21 +46,13 @@ def print_config_summary() -> None:
     print(f"  API  : http://{http_bind}:{os.getenv('HTTP_PORT', '8081')}")
     print(f"  5m   : {'开' if _env_bool('DH_ENABLE_5M') else '关'}  →  {_enabled_assets('DH_ENABLE_5M', ('btc', 'eth', 'sol'))}")
     print(f"  15m  : {'开' if _env_bool('DH_ENABLE_15M') else '关'}  →  {_enabled_assets('DH_ENABLE_15M', ('btc', 'eth'))}")
-    if lih:
-        dry = _env_bool("LIVE_LIH_DRY_RUN", True)
-        print(
-            f"  LIH  : leg1≤{os.getenv('LIH_LEG1_MAX_PRICE', '0.45')}  "
-            f"target={os.getenv('LIH_TARGET_COMBINED', '0.95')}  "
-            f"shares={os.getenv('LIH_LEG1_SHARES', '10')}  "
-            f"force={os.getenv('LIH_FORCE_BALANCE_SECS', '45')}s"
-        )
-        print(f"         live shadow (LIVE_LIH_DRY_RUN)={'开' if dry else '关 — 会真下单'}")
-    else:
-        print(
-            f"  DH   : sum≤{os.getenv('DH_SUM_TARGET', '0.95')}  "
-            f"disc≥{os.getenv('DH_MIN_DISCOUNT', '0.03')}  "
-            f"cd={os.getenv('DH_COOLDOWN_SECONDS', '30')}s"
-        )
+    dry = _env_bool("LIVE_LIH_DRY_RUN", True)
+    print(
+        f"  LIH  : mode={os.getenv('LIH_LEG1_MODE', 'trigger')}  "
+        f"target={os.getenv('LIH_TARGET_COMBINED', '0.94')}  "
+        f"shares={os.getenv('LIH_LEG1_SHARES', '20')}"
+    )
+    print(f"         live shadow (LIVE_LIH_DRY_RUN)={'开' if dry else '关 — 会真下单'}")
     print(
         f"  风控 : pos={os.getenv('RISK_MAX_POSITION_FRACTION', '0.08')}  "
         f"daily={os.getenv('RISK_DAILY_LOSS_LIMIT', '0.20')}  "
@@ -185,10 +176,9 @@ def main() -> int:
                 pass
 
     load_dotenv()
-    lih = _env_bool("LIH_ENABLED", True)
     live_dry = _env_bool("LIVE_LIH_DRY_RUN", True)
     skip_prelive = args.skip_prelive or _env_bool("START_SKIP_PRELIVE", False)
-    if lih and not skip_prelive:
+    if not skip_prelive:
         allow = args.allow_live or not live_dry
         min_samples = args.min_shadow_leg1 if not live_dry else max(args.min_shadow_leg1, 1)
         prelive = run_prelive_step(
@@ -201,11 +191,10 @@ def main() -> int:
             return 1
         if live_dry and not prelive.get("ok"):
             print("⚠️  LIH prelive 有警告（shadow 模式仍启动，请先处理重复 LEG1）", file=sys.stderr)
-    elif skip_prelive and lih:
+    else:
         print("[prelive] 跳过（START_SKIP_PRELIVE / --skip-prelive）", file=sys.stderr)
 
-    if lih:
-        maybe_reconcile_live_lih()
+    maybe_reconcile_live_lih()
 
     print_config_summary()
     os.environ["PREFLIGHT_SKIP"] = "1"

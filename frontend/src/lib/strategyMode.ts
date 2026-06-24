@@ -5,31 +5,19 @@ function closedLihRounds(state: LiveState): number {
   return Math.max(state.totalLihTrades, fromHistory);
 }
 
-function closedDhRounds(state: LiveState): number {
-  const fromHistory = state.tradeHistory.filter((r) => r.strategy === "DH" && r.status === "closed").length;
-  return Math.max(state.totalDhTrades, fromHistory);
-}
-
-/** Primary strategy: LIH unless bot explicitly reports dump_hedge with no LIH activity. */
-export function isLihPrimary(state: Pick<LiveState, "lihEnabled" | "strategy" | "tradeHistory">): boolean {
-  if (state.lihEnabled) return true;
-  const strat = (state.strategy || "").toLowerCase();
-  if (strat === "leg_in" || strat === "lih") return true;
-  const hasLihActivity = state.tradeHistory.some((r) => r.strategy === "LIH");
-  if (hasLihActivity) return true;
-  if (strat === "dump_hedge" || strat === "dh") return false;
+/** LIH-only stack; always treat as LIH for UI. */
+export function isLihPrimary(_state: Pick<LiveState, "lihEnabled" | "strategy" | "tradeHistory">): boolean {
   return true;
 }
 
-export function strategyShortLabel(state: Pick<LiveState, "lihEnabled" | "strategy" | "tradeHistory">): string {
-  return isLihPrimary(state) ? "LIH" : "DH";
+export function strategyShortLabel(_state: Pick<LiveState, "lihEnabled" | "strategy" | "tradeHistory">): string {
+  return "LIH";
 }
 
-/** Closed-round counter from bot state + trade history. */
 export function cumulativeClosedTrades(state: LiveState): number {
-  return isLihPrimary(state) ? closedLihRounds(state) : closedDhRounds(state);
+  return closedLihRounds(state);
 }
 
 export function strategyRealizedPnl(state: LiveState): number {
-  return isLihPrimary(state) ? state.lihPnl : state.dhPnl;
+  return state.lihPnl;
 }

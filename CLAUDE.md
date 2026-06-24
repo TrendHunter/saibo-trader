@@ -10,7 +10,7 @@ A Polymarket arbitrage bot trading binary "Up or Down" markets (BTC/ETH/SOL/XRP,
 2. **Python glue at repo root** — `dashboard_bridge.py` (WS server), `cli_dashboard.py` (Rich terminal UI), plus helper scripts the C++ core shells out to.
 3. **`frontend/`** — Next.js 16 web dashboard (Prisma + SQLite, NextAuth, Tailwind 4).
 
-The active strategy is **Leg-In Hedge (LIH)**: buy the cheap leg first, then rebalance / hedge to target combined price (`LIH_TARGET_COMBINED`, default 0.95). **Dump Hedge (DH)** is archived under `archive/dh-only/` — set `LIH_ENABLED=false` to restore DH-only mode. Latency arb was removed; see root `README.md` for current architecture (not `SPECS.md`).
+The active strategy is **Leg-In Hedge (LIH)** only (`LegInHedgeDetector`). Default: **trigger mode** + endgame ladder. **Dump Hedge removed** (2026-06-17); old tree in `backup/source-snapshot-2026-06-17.zip`. Market toggles still use env prefix `DH_ENABLE_*`. See `README.md` and `docs/LIH_VERSION.md`.
 
 ## Commands
 
@@ -46,12 +46,12 @@ trading-core (C++) ──stdout JSON lines──> dashboard_bridge.py ──ws:/
 ```
 
 - The core prints its full state as single-line JSON to **stdout**; logs go to stderr. The bridge spawns the core as a subprocess, captures stdout, and broadcasts each JSON line to all WebSocket clients. Anything printed to stdout that isn't `{...}` JSON breaks nothing but is treated as a log line — keep stdout JSON-clean when editing the core.
-- Design rule from SPECS.md: the C++ core is never exposed to the internet; the frontend only observes via the bridge.
+- Design rule: the C++ core is never exposed to the internet; the frontend only observes via the bridge.
 
 ### C++ core (`trading-core/src/`)
 
 - `main.cpp` — orchestrator: parses `.env` itself (`load_env(".env")`, no library), runs the event loop, fetches USDC balance via Polygon RPC, triggers auto-redeem.
-- `signals/LegInHedgeDetector` — primary LIH strategy (live); `signals/DumpHedgeDetector` — legacy DH (inactive when `LIH_ENABLED=true`); `feeds/` — `BinanceFeed`, `PolymarketFeed`, `GammaClient`; `risk/RiskManager`; `exec/OrderRouter` (live via `clob_live.py`); `state/StateStore` and live state JSON persistence.
+- `signals/LegInHedgeDetector` — LIH strategy; `feeds/` — Binance/Polymarket/Gamma; `risk/RiskManager`; `exec/OrderRouter`; `state/StateStore`.
 - Adding a `.cpp` file requires listing it in `trading-core/CMakeLists.txt` `SOURCES`.
 
 ### C++ ↔ Python coupling
@@ -71,11 +71,12 @@ So the core must run from the repo root, and changes to these scripts' stdout fo
 
 ### Configuration
 
-Everything is driven by the root `.env` (see `.env.example`) and `web.env` for the Next.js dashboard (see `web.env.example`). Key bot vars: `LIH_ENABLED`, wallet keys, `RISK_*`, LIH tuning, `DH_ENABLE_*`, `AUTO_REDEEM`. VPS production uses bare-metal `server_start_bot.sh` + `server_start_web.sh` at `/opt/polymarket-bot` — see root `README.md`.
+Everything is driven by the root `.env` (see `.env.example`) and `web.env` for the Next.js dashboard. Key bot vars: wallet keys, `RISK_*`, LIH tuning, `DH_ENABLE_*` (market toggles), `AUTO_REDEEM`.
 
 ## Docs
 
 - `README.md` — current architecture, LIH flow, ops commands
 - `deploy/README.md` — Docker single/multi-instance and bare-metal systemd (Chinese)
-- `SPECS.md` — **deprecated** early design draft (latency arb, Redis/Postgres); do not use for implementation
+- `backup/` — pre-cleanup full source zip
+- `README.md` — architecture and ops
 - `deploy/LIVE_READINESS.md`, `manual.md` — operations notes
