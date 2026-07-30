@@ -162,7 +162,9 @@ VPS shadow 主路径是 **`LIH_LEG1_MODE=mm2`**（对照外部 tracker `m2` 包�
 
 1. 攒当前 marker 样本（建议 ≥20–30 单）再 bot↔m2 同窗对比  
 2. 候选下一刀：`flat_book` 对齐、early **NO** 收紧、m2-only 漏窗  
-3. 拉包：`python scripts/pull_tracker_packs.py --accounts m2 --latest 3`；观测：`python scripts/_pull_vps_observation_data.py --marker <marker>`
+3. 拉包：`python scripts/pull_tracker_packs.py --accounts m2 --latest 3`；观测：`python scripts/_pull_vps_observation_data.py --marker <marker>`  
+4. **本地研究全量同步（推荐开机跑）**：`python scripts/sync_research_from_vps.py`  
+   → 拉 shadow / lih_skip / m2·m3·m4 日包 / session 文件 / 脱敏 LIH env，并切当前 marker 样本到 `data/pull_*_research/`
 
 分析备忘：`data/compare_triple/bprime_vs_sessionalign_compare.txt`、`early_yes_holefix_deploy_note.txt`（本地，可不入库）。
 
