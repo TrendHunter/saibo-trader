@@ -9,14 +9,15 @@
 #
 # Env overrides:
 #   POLYMARKET_ROOT=/opt/polymarket-bot
-#   WEB_MODE=full|fast|skip     (default: full)
+#   WEB_MODE=full|fast|skip     (default: skip — bot-only; use full|fast or START_WEB=true)
 #   SKIP_BUILD=1                skip C++ rebuild
 #   SKIP_GIT=1                  skip git pull
 #   SKIP_BOT=1 / SKIP_WEB=1
+# Manual dashboard: bash server_start_web.sh  or  bash scripts/start_web.sh
 set -euo pipefail
 
 ROOT="${POLYMARKET_ROOT:-/opt/polymarket-bot}"
-WEB_MODE="${WEB_MODE:-full}"
+WEB_MODE="${WEB_MODE:-skip}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 SKIP_GIT="${SKIP_GIT:-0}"
 SKIP_BOT="${SKIP_BOT:-0}"
@@ -31,6 +32,19 @@ fi
 
 cd "$ROOT"
 mkdir -p logs
+
+if [ -f .env ]; then
+  # shellcheck disable=SC1091
+  set -a && source .env && set +a
+fi
+case "$(echo "${START_WEB:-false}" | tr '[:upper:]' '[:lower:]')" in
+  true|1|yes|on) START_WEB_ON=1 ;;
+  *) START_WEB_ON=0 ;;
+esac
+if [ "$START_WEB_ON" = "1" ] && [ "$SKIP_WEB" != "1" ] && [ "$WEB_MODE" = "skip" ]; then
+  WEB_MODE=fast
+  log "START_WEB=true — web step enabled (WEB_MODE=fast)"
+fi
 
 if [ "$SKIP_GIT" != "1" ]; then
   if [ -d .git ]; then
@@ -66,7 +80,12 @@ if [ "$SKIP_BOT" != "1" ]; then
 fi
 
 if [ "$SKIP_WEB" = "1" ]; then
-  log "SKIP_WEB=1 — done"
+  log "SKIP_WEB=1 — bot-only (start dashboard: bash server_start_web.sh)"
+  exit 0
+fi
+
+if [ "$WEB_MODE" = "skip" ]; then
+  log "WEB_MODE=skip — bot-only (start dashboard: bash server_start_web.sh)"
   exit 0
 fi
 
@@ -97,9 +116,6 @@ case "$WEB_MODE" in
     export NEXTAUTH_URL="$PUBLIC_URL"
     bash server_restart_web.sh
     bash scripts/web_install_watchdog.sh 2>/dev/null || true
-    ;;
-  skip)
-    log "WEB_MODE=skip — bot only"
     ;;
   *)
     echo "ERROR: unknown WEB_MODE=$WEB_MODE (use full|fast|skip)" >&2

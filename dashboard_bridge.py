@@ -21,9 +21,10 @@ from bot_config import (
 )
 
 try:
-    from clob_live import post_fak_order, resolve_order_fill
+    from clob_live import post_fak_order, post_gtc_order, resolve_order_fill
 except ImportError:
     post_fak_order = None
+    post_gtc_order = None
     resolve_order_fill = None
 
 try:
@@ -45,24 +46,63 @@ latest_data = "{}"
 _core_ready_printed = False
 _WALLET_PERSIST_KEYS = ("realWalletBalance", "cashBalance", "positionsValue", "walletSource")
 _SHADOW_LOG_PATH = Path(os.getenv("BRIDGE_LOG_PATH", "logs/bridge.log"))
+_LIH_SKIP_LOG_PATH = Path(os.getenv("LIH_SKIP_LOG_PATH", "logs/lih_skip.log"))
 _telemetry_log_flush_idx = 0
+_telemetry_last_line = None  # type: str | None
+
+
+def _append_lih_skip_line(text: str) -> None:
+    if "[LIH DEBUG]" not in text:
+        return
+    if not any(
+        k in text
+        for k in (
+            "entry-wait",
+            "entry-feasible-skip",
+            "entry-vwap-skip",
+            "entry-skip",
+        )
+    ):
+        return
+    try:
+        _LIH_SKIP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _LIH_SKIP_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except OSError:
+        pass
 
 
 def _flush_new_shadow_lines(obj: dict) -> None:
-    """Append new [LIVE LIH SHADOW] telemetry lines to bridge.log for prelive scans."""
-    global _telemetry_log_flush_idx
+    """Append new shadow/telemetry lines to bridge.log; LIH skips to lih_skip.log.
+
+    telemetryLog is a capped deque (100). An index cursor sticks at len==100 and
+    then never advances after ring rotation — track the last flushed line text.
+    """
+    global _telemetry_log_flush_idx, _telemetry_last_line
     tlog = obj.get("telemetryLog")
-    if not isinstance(tlog, list):
+    if not isinstance(tlog, list) or not tlog:
         return
-    start = min(_telemetry_log_flush_idx, len(tlog))
+    start = 0
+    if _telemetry_last_line is not None:
+        for i in range(len(tlog) - 1, -1, -1):
+            if str(tlog[i]) == _telemetry_last_line:
+                start = i + 1
+                break
+        else:
+            # Last line rotated out of the ring — flush whole buffer once (may dup).
+            start = 0
+    else:
+        start = min(_telemetry_log_flush_idx, len(tlog))
     try:
         with _SHADOW_LOG_PATH.open("a", encoding="utf-8") as f:
             for entry in tlog[start:]:
                 text = str(entry)
                 if "LIVE LIH SHADOW" in text:
                     f.write(text + "\n")
+                _append_lih_skip_line(text)
     except OSError:
         pass
+    _telemetry_last_line = str(tlog[-1])
     _telemetry_log_flush_idx = len(tlog)
 
 
@@ -229,6 +269,38 @@ def _run_preflight() -> None:
         print(f"[preflight] skipped: {exc}", file=sys.stderr)
 
 
+def _run_mm2_session_refresh() -> None:
+    if os.getenv("LIH_MM2_SESSION_FROM_OBS", "").strip().lower() not in ("1", "true", "yes"):
+        return
+    script = Path(__file__).resolve().parent / "scripts" / "mm2_session_refresh.py"
+    if not script.is_file():
+        print("[mm2_session] mm2_session_refresh.py missing — skip", file=sys.stderr)
+        return
+    try:
+        subprocess.run([sys.executable, str(script)], cwd=str(script.parent.parent), check=False)
+    except Exception as exc:
+        print(f"[mm2_session] refresh failed: {exc}", file=sys.stderr)
+
+
+def _start_regime_feed() -> None:
+    if os.getenv("REGIME_GATE_ENABLED", "").strip().lower() not in ("1", "true", "yes"):
+        return
+    script = Path(__file__).resolve().parent / "regime_feed.py"
+    if not script.is_file():
+        print("[regime_feed] regime_feed.py missing — skip", file=sys.stderr)
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            stdout=subprocess.DEVNULL,
+            stderr=sys.stderr,
+        )
+        print("[regime_feed] background feed started", file=sys.stderr)
+    except Exception as exc:
+        print(f"[regime_feed] start failed: {exc}", file=sys.stderr)
+
+
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if status >= 400:
@@ -337,7 +409,32 @@ class ConfigHTTPHandler(BaseHTTPRequestHandler):
                     _json_response(self, 400, {"error": "invalid token_id/price/size_shares"})
                     return
                 neg_risk = bool(body.get("neg_risk", False))
-                result = post_fak_order(token_id, price, size_shares, side, neg_risk=neg_risk)
+                order_type = str(body.get("order_type") or "FAK").strip().upper()
+                intent = str(body.get("intent") or "").strip()
+                side_ask = side_bid = None
+                if body.get("side_ask") is not None:
+                    try:
+                        side_ask = float(body["side_ask"])
+                    except (TypeError, ValueError):
+                        pass
+                if body.get("side_bid") is not None:
+                    try:
+                        side_bid = float(body["side_bid"])
+                    except (TypeError, ValueError):
+                        pass
+                if order_type == "GTC":
+                    if post_gtc_order is None:
+                        _json_response(self, 503, {"error": "post_gtc_order unavailable"})
+                        return
+                    result = post_gtc_order(
+                        token_id, price, size_shares, side,
+                        neg_risk=neg_risk, side_ask=side_ask, side_bid=side_bid, intent=intent,
+                    )
+                else:
+                    result = post_fak_order(
+                        token_id, price, size_shares, side,
+                        neg_risk=neg_risk, side_ask=side_ask, side_bid=side_bid, intent=intent,
+                    )
                 # Always 200 so C++ bridge parses order_id even when fill is still 0.
                 _json_response(self, 200, result)
                 return
@@ -533,7 +630,9 @@ def run_core():
 
     def log_stderr():
         for line in process.stderr:
-            print(f"[CORE LOG] {line.strip()}", file=sys.stderr)
+            text = line.strip()
+            print(f"[CORE LOG] {text}", file=sys.stderr)
+            _append_lih_skip_line(text)
 
     threading.Thread(target=log_stderr, daemon=True).start()
 
@@ -562,6 +661,8 @@ async def main():
     loop = asyncio.get_running_loop()
 
     _run_preflight()
+    _run_mm2_session_refresh()
+    _start_regime_feed()
     _print_startup_banner()
     threading.Thread(target=run_http_server, daemon=True).start()
     threading.Thread(target=_wallet_sync_loop, daemon=True).start()

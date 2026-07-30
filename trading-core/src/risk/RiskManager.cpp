@@ -1,4 +1,5 @@
 #include "RiskManager.h"
+#include "../telemetry/ShadowWindowRecorder.h"
 #include <spdlog/spdlog.h>
 #include <numeric>
 #include <cmath>
@@ -34,6 +35,9 @@ boost::json::object shadow_leg_snapshot(const LegInHedgePosition& p) {
     o["id"] = p.lih_id;
     o["asset"] = p.asset;
     o["windowMinutes"] = p.window_minutes;
+    o["endDateTs"] = p.end_date_ts;
+    o["windowStartTs"] = p.end_date_ts - static_cast<double>(p.window_minutes) * 60.0;
+    o["openedAt"] = p.opened_at;
     o["yesShares"] = p.yes_shares;
     o["noShares"] = p.no_shares;
     o["yesEntryPrice"] = p.yes_entry_price;
@@ -47,6 +51,20 @@ boost::json::object shadow_leg_snapshot(const LegInHedgePosition& p) {
     o["gap"] = gap;
     o["fullyHedged"] = matched >= 1.0 && gap <= 0.5;
     return o;
+}
+
+void shadow_row_exec_meta(boost::json::object& row, const LihExecMeta* exec) {
+    if (!exec) return;
+    if (!exec->post_order_type.empty()) row["post_order_type"] = exec->post_order_type;
+    if (!exec->trader_side.empty()) row["trader_side"] = exec->trader_side;
+    if (!exec->exec_class.empty()) row["exec_class"] = exec->exec_class;
+    if (!exec->intent.empty()) row["intent"] = exec->intent;
+    if (!exec->order_id.empty()) row["order_id"] = exec->order_id;
+    if (exec->has_side_ask) {
+        row["side_ask_at_fill"] = exec->side_ask_at_fill;
+        row["price_vs_ask_cents"] = exec->price_vs_ask_cents;
+    }
+    if (exec->has_side_bid) row["side_bid_at_fill"] = exec->side_bid_at_fill;
 }
 } // namespace
 
@@ -384,19 +402,21 @@ std::pair<bool, std::string> RiskManager::can_open_lih_leg(
     //     return {false, "LIH session leg cap reached (" + std::to_string(lih_session_max_legs_) + ")"};
     // }
     if (!add_to_existing_lih && lih_min_balance_usdc_ > 0.0 &&
+        !shadow_virtual_bankroll_ &&
         current_balance_ + 1e-6 < lih_min_balance_usdc_) {
         return {false, "Balance below LIH minimum ($" +
                        std::to_string(lih_min_balance_usdc_) + ", have $" +
                        std::to_string(current_balance_) + ")"};
     }
 
-    const double max_allowed = current_balance_ * max_position_fraction_;
-    const double leg_cap = std::min(max_allowed, current_balance_);
+    const double sizing_bal = shadow_sizing_balance_unlocked();
+    const double max_allowed = sizing_bal * max_position_fraction_;
+    const double leg_cap = std::min(max_allowed, sizing_bal);
     if (leg_cost_usdc > leg_cap + 1e-6) {
         return {false, "LIH leg cost exceeds max allowed (" +
                        std::to_string(max_position_fraction_ * 100.0) + "% of balance)"};
     }
-    if (leg_cost_usdc > current_balance_) {
+    if (!shadow_virtual_bankroll_ && leg_cost_usdc > current_balance_) {
         return {false, "Insufficient balance"};
     }
     // LIH per-leg exchange minimum is ~$1 (detector enforces).
@@ -445,7 +465,8 @@ std::pair<bool, std::string> RiskManager::can_open_lih_leg(
 
 double RiskManager::lih_slot_cap_usdc_unlocked() const {
     if (lih_max_usdc_per_slot_ > 0.0) return lih_max_usdc_per_slot_;
-    return std::min(current_balance_ * max_position_fraction_, current_balance_);
+    const double bal = shadow_virtual_bankroll_ ? shadow_sizing_balance_unlocked() : current_balance_;
+    return std::min(bal * max_position_fraction_, bal);
 }
 
 double RiskManager::lih_slot_deployed_usdc_unlocked(const std::string& asset, int window_minutes) const {
@@ -481,8 +502,9 @@ double RiskManager::lih_slot_deployed_usdc(const std::string& asset, int window_
 
 double RiskManager::get_max_leg_cost_usdc() const {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
-    const double cap = current_balance_ * max_position_fraction_;
-    return std::min(cap, current_balance_);
+    const double bal = shadow_virtual_bankroll_ ? shadow_sizing_balance_unlocked() : current_balance_;
+    const double cap = bal * max_position_fraction_;
+    return std::min(cap, bal);
 }
 
 double RiskManager::get_lih_max_matched_shares() const {
@@ -990,6 +1012,30 @@ void RiskManager::set_lih_min_balance_usdc(double v) {
     spdlog::info("Risk config updated | lih_min_balance_usdc={:.2f}", lih_min_balance_usdc_);
 }
 
+void RiskManager::set_shadow_virtual_bankroll(bool v) {
+    std::lock_guard<std::recursive_mutex> lock(mtx_);
+    shadow_virtual_bankroll_ = v;
+    spdlog::info("Risk config updated | shadow_virtual_bankroll={}", v ? "on" : "off");
+}
+
+bool RiskManager::shadow_virtual_bankroll() const {
+    std::lock_guard<std::recursive_mutex> lock(mtx_);
+    return shadow_virtual_bankroll_;
+}
+
+void RiskManager::set_shadow_window_recorder(trading::ShadowWindowRecorder* r) {
+    std::lock_guard<std::recursive_mutex> lock(mtx_);
+    shadow_window_recorder_ = r;
+}
+
+double RiskManager::shadow_sizing_balance_unlocked() const {
+    if (!shadow_virtual_bankroll_) {
+        return std::max(0.0, current_balance_);
+    }
+    // Keep sizing stable for long shadow samples; PnL may drive balance negative.
+    return std::max(starting_balance_, 1.0);
+}
+
 double RiskManager::get_lih_min_balance_usdc() const {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     return lih_min_balance_usdc_;
@@ -1020,7 +1066,8 @@ bool RiskManager::try_begin_lih_leg1(const std::string& asset, int window_minute
     //                  asset, window_minutes, lih_session_max_legs_);
     //     return false;
     // }
-    if (lih_min_balance_usdc_ > 0.0 && current_balance_ + 1e-6 < lih_min_balance_usdc_) {
+    if (lih_min_balance_usdc_ > 0.0 && !shadow_virtual_bankroll_
+        && current_balance_ + 1e-6 < lih_min_balance_usdc_) {
         spdlog::info("[LIH] LEG1 blocked {} {}m — balance ${:.2f} < min ${:.2f}",
                      asset, window_minutes, current_balance_, lih_min_balance_usdc_);
         return false;
@@ -1066,7 +1113,7 @@ std::unordered_map<std::string, LegInHedgePosition> RiskManager::get_open_lih_po
 
 LegInHedgePosition RiskManager::register_lih_open_leg1(
     const trading::MarketInfo& market, bool buy_yes, double price, double shares, double now_sec,
-    bool is_paper, bool debit_balance, bool is_shadow) {
+    bool is_paper, bool debit_balance, bool is_shadow, const LihExecMeta* exec) {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     LegInHedgePosition pos;
     pos.lih_id = "LIH-" + market.asset + "-" + std::to_string(static_cast<uint64_t>(now_sec * 1000.0));
@@ -1121,16 +1168,22 @@ LegInHedgePosition RiskManager::register_lih_open_leg1(
         row["price"] = price;
         row["shares"] = shares;
         row["market"] = market.question;
+        const double wstart = pos.end_date_ts - static_cast<double>(pos.window_minutes) * 60.0;
+        row["secIn"] = now_sec - wstart;
         auto snap = shadow_leg_snapshot(pos);
         for (const auto& kv : snap) row[kv.key()] = kv.value();
+        shadow_row_exec_meta(row, exec);
         append_shadow_trade_log(std::move(row));
+        if (shadow_window_recorder_) {
+            shadow_window_recorder_->on_leg1(pos, buy_yes, price, shares, now_sec);
+        }
     }
     return pos;
 }
 
 void RiskManager::register_lih_add_leg(
     const std::string& lih_id, bool buy_yes, double price, double shares, bool is_paper,
-    bool debit_balance) {
+    bool debit_balance, const LihExecMeta* exec) {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     auto it = open_lih_positions_.find(lih_id);
     if (it == open_lih_positions_.end()) return;
@@ -1184,7 +1237,11 @@ void RiskManager::register_lih_add_leg(
         row["rebalanceCount"] = n;
         auto snap = shadow_leg_snapshot(it->second);
         for (const auto& kv : snap) row[kv.key()] = kv.value();
+        shadow_row_exec_meta(row, exec);
         append_shadow_trade_log(std::move(row));
+        if (shadow_window_recorder_) {
+            shadow_window_recorder_->on_hedge_fill(it->second);
+        }
     }
 }
 
@@ -1225,6 +1282,114 @@ void RiskManager::register_lih_add_paired(
     }
 }
 
+bool RiskManager::register_lih_unwind(
+    const std::string& lih_id, bool sell_yes, double bid_price, double shares, bool is_paper,
+    bool credit_balance) {
+    std::lock_guard<std::recursive_mutex> lock(mtx_);
+    auto it = open_lih_positions_.find(lih_id);
+    if (it == open_lih_positions_.end()) return false;
+    lih_rebalance_inflight_.erase(lih_id);
+
+    LegInHedgePosition& pos = it->second;
+    const double leg_sh = sell_yes ? pos.yes_shares : pos.no_shares;
+    if (leg_sh <= kFloatTol || bid_price <= kFloatTol) return false;
+    shares = std::min(shares, leg_sh);
+    if (shares <= kFloatTol) return false;
+
+    const double total_cost_before = pos.yes_cost + pos.no_cost;
+    double& leg_cost = sell_yes ? pos.yes_cost : pos.no_cost;
+    double& leg_shares = sell_yes ? pos.yes_shares : pos.no_shares;
+    double& leg_entry = sell_yes ? pos.yes_entry_price : pos.no_entry_price;
+
+    const double cost_removed = leg_cost * (shares / leg_sh);
+    const double proceeds = bid_price * shares;
+    const double exit_fee = proceeds * fee_rate_;
+    const double net = proceeds - exit_fee;
+    const double fee_alloc = total_cost_before > kFloatTol
+        ? pos.entry_fees * (cost_removed / total_cost_before)
+        : pos.entry_fees;
+    const double realized = net - cost_removed - fee_alloc;
+
+    leg_cost -= cost_removed;
+    leg_shares -= shares;
+    if (leg_shares <= kFloatTol) {
+        leg_shares = 0.0;
+        leg_cost = 0.0;
+        leg_entry = 0.0;
+    } else {
+        leg_entry = leg_cost / leg_shares;
+    }
+    pos.entry_fees = std::max(0.0, pos.entry_fees - fee_alloc);
+
+    if (credit_balance && !pos.is_shadow) {
+        current_balance_ += net;
+        lih_pnl_ += realized;
+        total_pnl_ += realized;
+        if (realized > 0) winning_trades_++;
+    }
+
+    const char* mode_tag = pos.is_shadow ? "SHADOW" : (is_paper ? "PAPER" : "LIVE");
+    spdlog::info(
+        "[LIH {}] UNWIND {} | sell {} {:.2f}sh @ {:.4f} | realized ${:+.2f} | YES {:.2f} NO {:.2f} | bal ${:.2f}",
+        mode_tag, lih_id, sell_yes ? "YES" : "NO", shares, bid_price, realized,
+        pos.yes_shares, pos.no_shares, current_balance_);
+
+    if (pos.is_shadow) {
+        boost::json::object row;
+        row["event"] = "UNWIND";
+        row["side"] = sell_yes ? "YES" : "NO";
+        row["price"] = bid_price;
+        row["shares"] = shares;
+        row["realizedPnlUsdc"] = realized;
+        auto snap = shadow_leg_snapshot(pos);
+        for (const auto& kv : snap) row[kv.key()] = kv.value();
+        append_shadow_trade_log(std::move(row));
+    }
+
+    const bool flat = pos.yes_shares <= kFloatTol && pos.no_shares <= kFloatTol;
+    if (flat) {
+        LegInHedgePosition closed = pos;
+        closed.closed_at = now();
+        closed.yes_exit_price = sell_yes ? bid_price : 0.0;
+        closed.no_exit_price = sell_yes ? 0.0 : bid_price;
+        closed.pnl_usdc = realized;
+        closed.exit_reason = "unwind (flat)";
+        open_lih_positions_.erase(it);
+        {
+            const std::string key = lih_slot_key(closed.asset, closed.window_minutes);
+            lih_leg1_inflight_.erase(key);
+            lih_leg1_inflight_since_.erase(key);
+        }
+        closed_lih_positions_.push_back(closed);
+        if (closed_lih_positions_.size() > 500) {
+            closed_lih_positions_.erase(closed_lih_positions_.begin());
+        }
+        spdlog::info("[LIH {}] CLOSED {} | unwind flat | PnL ${:+.2f}",
+                     mode_tag, lih_id, realized);
+        if (closed.is_shadow) {
+            boost::json::object row;
+            row["event"] = "CLOSED";
+            row["exitReason"] = closed.exit_reason;
+            row["yesExitPrice"] = closed.yes_exit_price.value_or(0.0);
+            row["noExitPrice"] = closed.no_exit_price.value_or(0.0);
+            row["pnlUsdc"] = realized;
+            auto snap = shadow_leg_snapshot(closed);
+            for (const auto& kv : snap) row[kv.key()] = kv.value();
+            append_shadow_trade_log(std::move(row));
+            if (shadow_window_recorder_) {
+                shadow_window_recorder_->on_closed(closed, realized);
+            }
+        } else if (!closed.paper_mode) {
+            reset_lih_session();
+        }
+        if (!closed.is_shadow) {
+            check_risk_thresholds();
+            consolidate_closed_lih_positions();
+        }
+    }
+    return true;
+}
+
 std::optional<LegInHedgePosition> RiskManager::register_lih_close(
     const std::string& lih_id,
     double yes_exit,
@@ -1256,7 +1421,11 @@ std::optional<LegInHedgePosition> RiskManager::register_lih_close(
     pos.no_exit_price = no_exit;
     pos.pnl_usdc = pnl;
     pos.exit_reason = exit_reason;
-    if (!pos.is_shadow) {
+    if (pos.is_shadow) {
+        if (shadow_virtual_bankroll_) {
+            current_balance_ += pnl;
+        }
+    } else {
         current_balance_ += proceeds;
         lih_pnl_ += pnl;
         total_pnl_ += pnl;
@@ -1288,9 +1457,15 @@ std::optional<LegInHedgePosition> RiskManager::register_lih_close(
         row["noExitPrice"] = no_exit;
         row["pnlUsdc"] = pnl;
         row["rebalanceCount"] = pos.rebalance_count;
+        if (shadow_virtual_bankroll_) {
+            row["bankrollUsdc"] = current_balance_;
+        }
         auto snap = shadow_leg_snapshot(pos);
         for (const auto& kv : snap) row[kv.key()] = kv.value();
         append_shadow_trade_log(std::move(row));
+        if (shadow_window_recorder_) {
+            shadow_window_recorder_->on_closed(pos, pnl);
+        }
     } else if (!pos.paper_mode) {
         // DEBUG single-round test: re-enable auto-pause on round close (LIH_PAUSE_AFTER_ROUND).
         // maybe_pause_after_lih_round(exit_reason);
@@ -1549,6 +1724,7 @@ void RiskManager::reconcile_paper_balance(bool reset_trading_halt) {
 
 void RiskManager::check_risk_thresholds() {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
+    if (shadow_virtual_bankroll_) return;
     if (status_ == TradingStatus::KILLED) return;
 
     const double equity = compute_equity_unlocked();
@@ -1581,6 +1757,7 @@ void RiskManager::check_risk_thresholds() {
 
 void RiskManager::check_circuit_breaker() {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
+    if (shadow_virtual_bankroll_) return;
     if (!circuit_breaker_enabled_) return;
     if (status_ != TradingStatus::ACTIVE) return;
 
@@ -1871,7 +2048,9 @@ bool RiskManager::import_live_lih_state(const boost::json::object& doc) {
     std::lock_guard<std::recursive_mutex> lock(mtx_);
     try {
         if (!doc.contains("version") || doc.at("version").as_int64() != 1) return false;
-        if (doc.contains("current_balance")) current_balance_ = doc.at("current_balance").as_double();
+        if (doc.contains("current_balance") && !shadow_virtual_bankroll_) {
+            current_balance_ = doc.at("current_balance").as_double();
+        }
         if (doc.contains("total_lih_trades")) {
             total_lih_trades_ = static_cast<int>(doc.at("total_lih_trades").as_int64());
         }

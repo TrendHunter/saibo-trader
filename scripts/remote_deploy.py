@@ -465,6 +465,8 @@ print("patched", len(updates), "keys")
                 "trading-core/src/risk/RiskManager.h",
                 "trading-core/src/risk/RiskManager.cpp",
                 "trading-core/src/main.cpp",
+                "trading-core/src/telemetry/ShadowWindowRecorder.h",
+                "trading-core/src/telemetry/ShadowWindowRecorder.cpp",
                 "bot_config.py",
                 "dashboard_bridge.py",
                 "start_bot.py",

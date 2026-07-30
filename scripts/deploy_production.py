@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""One-click production deploy: push local tree -> VPS bot + Web (bare-metal /opt/polymarket-bot).
+"""One-click production deploy: push local tree -> VPS bot (+ optional Web).
 
-Matches current production: git pull, build-lowmem.sh, server_start_bot.sh, server_start_web.sh.
+Matches production layout: git pull, build-lowmem.sh, server_start_bot.sh.
+Dashboard is off by default (1GB VPS); use --with-web to build/start Next.js.
 
 Prerequisites:
   - Root `.deploy.local` with DEPLOY_SSH_PASSWORD="..."
@@ -9,12 +10,12 @@ Prerequisites:
   - Committed changes pushed to origin/main (server pulls from GitHub)
 
 Usage:
-  python scripts/deploy_production.py                 # full deploy (bot + web build)
-  python scripts/deploy_production.py --web-fast      # bot rebuild + web restart only
+  python scripts/deploy_production.py                 # bot-only deploy (default)
+  python scripts/deploy_production.py --with-web      # bot + web full build
+  python scripts/deploy_production.py --with-web --web-fast  # bot + web restart only
   python scripts/deploy_production.py --skip-build    # git pull + restart, no C++ compile
-  python scripts/deploy_production.py --bot-only      # no web step
-  python scripts/deploy_production.py --bot-only --skip-build  # lightweight VPS (~1GB RAM)
-  python scripts/deploy_production.py --setup         # first-time clone + venv + build + web.env hint
+  python scripts/deploy_production.py --setup         # first-time clone + venv + build
+  # On VPS, start dashboard anytime: bash server_start_web.sh
 """
 from __future__ import annotations
 
@@ -44,7 +45,9 @@ UPLOAD_FILES: list[tuple[str, str]] = [
     ("scripts/deploy_vps_full.sh", f"{PROJ}/scripts/deploy_vps_full.sh"),
     ("scripts/server_start_bot.sh", f"{PROJ}/server_start_bot.sh"),
     ("scripts/server_start_web.sh", f"{PROJ}/server_start_web.sh"),
+    ("scripts/server_stop_web.sh", f"{PROJ}/server_stop_web.sh"),
     ("scripts/server_stop_web.sh", f"{PROJ}/scripts/server_stop_web.sh"),
+    ("scripts/start_web.sh", f"{PROJ}/scripts/start_web.sh"),
     ("scripts/server_restart_web.sh", f"{PROJ}/server_restart_web.sh"),
     ("scripts/web_run.sh", f"{PROJ}/scripts/web_run.sh"),
     ("scripts/web_watchdog.sh", f"{PROJ}/scripts/web_watchdog.sh"),
@@ -88,8 +91,9 @@ def upload_scripts(client: paramiko.SSHClient) -> None:
         sftp.close()
 
 
-def run_setup(client: paramiko.SSHClient) -> int:
+def run_setup(client: paramiko.SSHClient, *, with_web: bool) -> int:
     upload_scripts(client)
+    web_mode = "full" if with_web else "skip"
     steps = [
         "command -v git && python3 --version",
         f"test -d '{PROJ}/.git' && echo exists || git clone --branch main '{REPO}' '{PROJ}'",
@@ -107,7 +111,7 @@ def run_setup(client: paramiko.SSHClient) -> int:
         f"sed -i 's|^NEXTAUTH_URL=.*|NEXTAUTH_URL=http://{HOST}:3001|' '{PROJ}/web.env' || "
         f"echo 'NEXTAUTH_URL=http://{HOST}:3001' >> '{PROJ}/web.env'",
         f"chmod +x '{PROJ}/scripts/deploy_vps_full.sh' '{PROJ}/build-lowmem.sh' && "
-        f"WEB_MODE=full bash '{PROJ}/scripts/deploy_vps_full.sh'",
+        f"WEB_MODE={web_mode} bash '{PROJ}/scripts/deploy_vps_full.sh'",
         "firewall-cmd --permanent --add-port=3001/tcp 2>/dev/null || true",
         "firewall-cmd --reload 2>/dev/null || true",
         f"echo 'Edit {PROJ}/web.env AUTH_USERNAME/AUTH_PASSWORD then re-run deploy_production.py'",
@@ -138,7 +142,8 @@ def run_deploy(
     ]
     chmod_targets = (
         f"'{PROJ}/scripts/deploy_vps_full.sh' '{PROJ}/build-lowmem.sh' "
-        f"'{PROJ}/server_start_bot.sh'"
+        f"'{PROJ}/server_start_bot.sh' '{PROJ}/server_stop_web.sh' "
+        f"'{PROJ}/scripts/server_stop_web.sh' '{PROJ}/scripts/start_web.sh'"
     )
     if not bot_only:
         chmod_targets += f" '{PROJ}/server_start_web.sh'"
@@ -155,19 +160,31 @@ def run_deploy(
         f"http://127.0.0.1:3001/login http://127.0.0.1:8081/health",
         timeout=30,
     )
-    print(f"\nDashboard: http://{HOST}:3001/login", file=sys.stderr)
+    if bot_only:
+        print(
+            f"\nBot-only deploy. Start dashboard on VPS:\n"
+            f"  bash {PROJ}/server_start_web.sh",
+            file=sys.stderr,
+        )
+    else:
+        print(f"\nDashboard: http://{HOST}:3001/login", file=sys.stderr)
     return rc
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="One-click VPS production deploy (bot + web)")
+    ap = argparse.ArgumentParser(description="One-click VPS production deploy (bot-only by default)")
     ap.add_argument("--setup", action="store_true", help="First-time server bootstrap")
-    ap.add_argument("--web-fast", action="store_true", help="Skip npm build; restart web only")
+    ap.add_argument("--with-web", action="store_true", help="Include dashboard build/start")
+    ap.add_argument("--web-fast", action="store_true", help="With --with-web: skip npm build, restart only")
     ap.add_argument("--skip-build", action="store_true", help="Skip C++ rebuild")
     ap.add_argument("--skip-git", action="store_true", help="Skip git pull on server")
-    ap.add_argument("--bot-only", action="store_true", help="Deploy bot only, no web")
+    ap.add_argument("--bot-only", action="store_true", help="Bot only (default; same as omitting --with-web)")
     ap.add_argument("--force", action="store_true", help="Deploy even if local commits not pushed")
     args = ap.parse_args()
+
+    if args.with_web and args.bot_only:
+        print("ERROR: --with-web and --bot-only conflict", file=sys.stderr)
+        return 1
 
     if not args.force and not args.skip_git and git_push_ahead():
         print(
@@ -183,14 +200,15 @@ def main() -> int:
     client.connect(HOST, username=USER, password=load_password(), timeout=45)
     try:
         if args.setup:
-            return run_setup(client)
+            return run_setup(client, with_web=args.with_web)
         web_mode = "fast" if args.web_fast else "full"
+        bot_only = not args.with_web
         return run_deploy(
             client,
             web_mode=web_mode,
             skip_build=args.skip_build,
             skip_git=args.skip_git,
-            bot_only=args.bot_only,
+            bot_only=bot_only,
         )
     finally:
         client.close()

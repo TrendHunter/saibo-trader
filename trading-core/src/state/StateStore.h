@@ -155,6 +155,8 @@ public:
     }
     double lih_leg1_max_price() const { return lih_leg1_max_price_; }
     double lih_target_combined() const { return lih_target_combined_; }
+    void set_lih_mid_soft_cap(double v) { lih_mid_soft_cap_ = std::max(0.0, v); }
+    double lih_mid_soft_cap() const { return lih_mid_soft_cap_; }
     void set_lih_leg1_mode(const std::string& mode) { lih_leg1_mode_ = mode; }
     bool lih_leg1_trend_mode() const { return lih_leg1_mode_ == "trend" || lih_leg1_mode_ == "expensive"; }
     bool lih_leg1_trigger_mode() const { return lih_leg1_mode_ == "trigger"; }
@@ -162,6 +164,23 @@ public:
     double lih_leg1_trend_max_price() const { return lih_leg1_trend_max_price_; }
     void set_lih_leg1_trigger_min(double v) { lih_leg1_trigger_min_ = v; }
     double lih_leg1_trigger_min() const { return lih_leg1_trigger_min_; }
+    void set_lih_leg1_trigger_max(double v) { lih_leg1_trigger_max_ = v; }
+    double lih_leg1_trigger_max() const { return lih_leg1_trigger_max_; }
+    /** leg1 execution: "taker" (FAK) or "gtc" (limit clip; shadow dry-run sim first). */
+    void set_lih_leg1_order_mode(std::string mode) { lih_leg1_order_mode_ = std::move(mode); }
+    const std::string& lih_leg1_order_mode() const { return lih_leg1_order_mode_; }
+    /** LIH decision quotes: "rest" = REST book only (shadow-aligned); else max(WS,REST). */
+    void set_lih_quote_mode(std::string mode) { lih_quote_mode_ = std::move(mode); }
+    bool lih_quote_rest_only() const { return lih_quote_mode_ == "rest"; }
+    /** Secondary (off BJ main) gates — mirrored for OrderRouter exec-time recheck. */
+    void set_mm2_secondary_gates(int bj_start, int bj_end_exclusive, double offhours_min_ask) {
+        mm2_main_bj_start_ = bj_start;
+        mm2_main_bj_end_ = bj_end_exclusive;
+        mm2_offhours_min_ask_ = offhours_min_ask > 0.0 ? offhours_min_ask : 0.0;
+    }
+    int mm2_main_bj_start() const { return mm2_main_bj_start_; }
+    int mm2_main_bj_end() const { return mm2_main_bj_end_; }
+    double mm2_offhours_min_ask() const { return mm2_offhours_min_ask_; }
     void set_live_lih_dry_run(bool v) { live_lih_dry_run_ = v; }
     bool live_lih_dry_run() const { return live_lih_dry_run_; }
     void set_trades_baseline_ts(double ts) { trades_baseline_ts_ = ts; }
@@ -198,9 +217,16 @@ private:
     bool lih_enabled_ = true;
     double lih_leg1_max_price_ = 0.45;
     double lih_target_combined_ = 0.94;
+    double lih_mid_soft_cap_ = 0.0;
     std::string lih_leg1_mode_ = "cheap";
     double lih_leg1_trend_max_price_ = 0.65;
     double lih_leg1_trigger_min_ = 0.70;
+    double lih_leg1_trigger_max_ = 0.0;
+    std::string lih_leg1_order_mode_ = "taker";
+    std::string lih_quote_mode_ = "conservative";
+    int mm2_main_bj_start_ = 8;
+    int mm2_main_bj_end_ = 17;
+    double mm2_offhours_min_ask_ = 0.0;
     bool lih_use_mirror_ = true;
     bool live_lih_dry_run_ = true;
     double trades_baseline_ts_ = 0.0;

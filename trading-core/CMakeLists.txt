@@ -43,12 +43,15 @@ set(SOURCES
     src/state/StateStore.cpp
     src/state/PaperStateStore.cpp
     src/feeds/BinanceFeed.cpp
+    src/feeds/ChainlinkFeed.cpp
     src/feeds/PolymarketFeed.cpp
     src/feeds/GammaClient.cpp
     src/risk/RiskManager.cpp
     src/exec/EIP712Signer.cpp
     src/exec/OrderRouter.cpp
     src/signals/LegInHedgeDetector.cpp
+    src/signals/RegimeGate.cpp
+    src/telemetry/ShadowWindowRecorder.cpp
 )
 
 add_executable(trading-core ${SOURCES})

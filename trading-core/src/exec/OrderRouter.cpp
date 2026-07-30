@@ -13,6 +13,7 @@
 #include <fmt/core.h>
 #include <iostream>
 #include <chrono>
+#include <ctime>
 #include <random>
 #include <cmath>
 #include <algorithm>
@@ -26,7 +27,31 @@ constexpr double kMinLegUsdc = 1.0;
 constexpr double kFloatTol = 1e-6;
 constexpr double kMinFillShares = 0.01;
 constexpr double kDepthFillRatio = 0.90;
-constexpr double kMaxAskPriceSlack = 1.02;
+constexpr double kMaxAskPriceSlack = 1.05;
+
+/** Beijing hour of market window start (UTC+8, no DST) — matches detector. */
+int window_start_bj_hour(const MarketInfo& market) {
+    const double window_total_sec = std::max(60.0, market.window_minutes * 60.0);
+    const time_t t = static_cast<time_t>(market.end_date_ts - window_total_sec);
+    tm utc{};
+#ifdef _WIN32
+    gmtime_s(&utc, &t);
+#else
+    gmtime_r(&t, &utc);
+#endif
+    return (utc.tm_hour + 8) % 24;
+}
+
+/** Reject LEG1 when fresh exec ask is below offhours floor (detector may have used stale REST). */
+bool offhours_exec_ask_blocked(const StateStore& store, const MarketInfo& market, double exec_px) {
+    const double min_ask = store.mm2_offhours_min_ask();
+    const int bj_start = store.mm2_main_bj_start();
+    const int bj_end = store.mm2_main_bj_end();
+    if (min_ask <= kFloatTol || bj_end <= bj_start) return false;
+    const int bj_h = window_start_bj_hour(market);
+    const bool in_main = bj_h >= bj_start && bj_h < bj_end;
+    return !in_main && exec_px + kFloatTol < min_ask;
+}
 
 bool leg_meets_minimum(double price, double size_shares) {
     return price > 0.0 && size_shares * price >= kMinLegUsdc - kFloatTol;
@@ -40,6 +65,108 @@ bool bridge_fill_is_terminal_dead(const std::string& error_msg, const std::strin
 bool lih_action_is_force(const trading::LegInAction& act) {
     return act.note.find("force") != std::string::npos
         || act.note.find("endgame") != std::string::npos;
+}
+
+void parse_json_exec_meta(const boost::json::object& j, LegFillResult& r) {
+    if (j.contains("post_order_type") && j.at("post_order_type").is_string()) {
+        r.post_order_type = std::string(j.at("post_order_type").as_string());
+    }
+    if (j.contains("trader_side") && j.at("trader_side").is_string()) {
+        r.trader_side = std::string(j.at("trader_side").as_string());
+    }
+    if (j.contains("exec_class") && j.at("exec_class").is_string()) {
+        r.exec_class = std::string(j.at("exec_class").as_string());
+    }
+    if (j.contains("intent") && j.at("intent").is_string()) {
+        r.intent = std::string(j.at("intent").as_string());
+    }
+    if (j.contains("side_ask_at_fill")) {
+        const auto& v = j.at("side_ask_at_fill");
+        if (v.is_double()) {
+            r.side_ask_at_fill = v.as_double();
+            r.has_side_ask = true;
+        } else if (v.is_int64()) {
+            r.side_ask_at_fill = static_cast<double>(v.as_int64());
+            r.has_side_ask = true;
+        }
+    }
+    if (j.contains("side_bid_at_fill")) {
+        const auto& v = j.at("side_bid_at_fill");
+        if (v.is_double()) {
+            r.side_bid_at_fill = v.as_double();
+            r.has_side_bid = true;
+        } else if (v.is_int64()) {
+            r.side_bid_at_fill = static_cast<double>(v.as_int64());
+            r.has_side_bid = true;
+        }
+    }
+    if (j.contains("price_vs_ask_cents")) {
+        const auto& v = j.at("price_vs_ask_cents");
+        if (v.is_double()) r.price_vs_ask_cents = v.as_double();
+        else if (v.is_int64()) r.price_vs_ask_cents = static_cast<double>(v.as_int64());
+    }
+}
+
+risk::LihExecMeta exec_meta_from_fill(const LegFillResult& fill) {
+    risk::LihExecMeta m;
+    m.post_order_type = fill.post_order_type.empty() ? "FAK" : fill.post_order_type;
+    m.trader_side = fill.trader_side;
+    m.exec_class = fill.exec_class;
+    m.intent = fill.intent;
+    m.order_id = fill.order_id;
+    m.side_ask_at_fill = fill.side_ask_at_fill;
+    m.side_bid_at_fill = fill.side_bid_at_fill;
+    m.price_vs_ask_cents = fill.price_vs_ask_cents;
+    m.has_side_ask = fill.has_side_ask;
+    m.has_side_bid = fill.has_side_bid;
+    return m;
+}
+
+void infer_shadow_exec_meta(
+    risk::LihExecMeta& m,
+    double fill_px,
+    double side_ask,
+    double side_bid,
+    const std::string& post_type,
+    const std::string& intent,
+    const std::string& order_id = "") {
+    m.post_order_type = post_type;
+    m.intent = intent;
+    m.order_id = order_id;
+    if (side_ask > kFloatTol) {
+        m.side_ask_at_fill = side_ask;
+        m.price_vs_ask_cents = (fill_px - side_ask) * 100.0;
+        m.has_side_ask = true;
+    }
+    if (side_bid > kFloatTol) {
+        m.side_bid_at_fill = side_bid;
+        m.has_side_bid = true;
+    }
+    constexpr double tick = 0.01;
+    if (m.has_side_ask) {
+        if (fill_px < side_ask - tick) m.exec_class = "limit_below_ask";
+        else if (m.has_side_bid && fill_px <= side_bid + tick) m.exec_class = "limit_at_bid";
+        else if (fill_px <= side_ask + tick) m.exec_class = "taker_at_ask";
+        else m.exec_class = "taker_above_ask";
+    } else {
+        m.exec_class = "no_book";
+    }
+    if (post_type == "FAK") m.trader_side = "TAKER";
+    else if (m.exec_class == "limit_below_ask" || m.exec_class == "limit_at_bid") m.trader_side = "MAKER";
+    else if (m.exec_class == "taker_at_ask" || m.exec_class == "taker_above_ask") m.trader_side = "TAKER";
+}
+
+std::string lih_intent_for(const trading::LegInAction& act) {
+    switch (act.kind) {
+    case trading::LegInAction::Kind::OpenLeg1:
+    case trading::LegInAction::Kind::AddLeg1:
+        return "leg1_clip";
+    case trading::LegInAction::Kind::CompleteHedge:
+        return "hedge";
+    case trading::LegInAction::Kind::UnwindLeg1:
+        return "unwind";
+    }
+    return "";
 }
 } // namespace
 
@@ -224,6 +351,28 @@ BookAskInfo OrderRouter::parse_book_asks(const boost::json::object& book) const 
             info.depth_shares += s;
         }
     }
+    if (book.contains("min_order_size")) {
+        try {
+            const auto& mv = book.at("min_order_size");
+            if (mv.is_string()) {
+                info.min_order_size = std::stod(std::string(mv.as_string()));
+            } else if (mv.is_double()) {
+                info.min_order_size = mv.as_double();
+            }
+        } catch (...) {}
+    }
+    if (book.contains("tick_size")) {
+        try {
+            const auto& tv = book.at("tick_size");
+            if (tv.is_string()) {
+                info.tick_size = std::stod(std::string(tv.as_string()));
+            } else if (tv.is_double()) {
+                info.tick_size = tv.as_double();
+            }
+        } catch (...) {}
+    }
+    if (info.min_order_size <= kFloatTol) info.min_order_size = 5.0;
+    if (info.tick_size <= kFloatTol) info.tick_size = 0.01;
     info.ok = true;
     return info;
 }
@@ -274,6 +423,12 @@ BookAskInfo OrderRouter::fetch_book_ask_info(const std::string& token_id) {
     return parse_book_asks(*book);
 }
 
+BookBidInfo OrderRouter::fetch_book_bid_info(const std::string& token_id) {
+    auto book = fetch_book_object(token_id);
+    if (!book) return {};
+    return parse_book_bids(*book);
+}
+
 void OrderRouter::refresh_rest_book(const std::vector<std::string>& token_ids) {
     for (const auto& token_id : token_ids) {
         auto book = fetch_book_object(token_id);
@@ -301,8 +456,19 @@ bool OrderRouter::check_book_depth(const std::string& token_id, double price, do
     return available >= size_shares * kDepthFillRatio;
 }
 
-LegFillResult OrderRouter::execute_leg_buy(const std::string& token_id, double price, double size_shares, bool is_neg_risk) {
+LegFillResult OrderRouter::execute_leg_buy(
+    const std::string& token_id, double price, double size_shares, bool is_neg_risk,
+    const std::string& order_type,
+    const std::string& intent,
+    double side_ask, double side_bid,
+    bool has_side_ask, bool has_side_bid) {
     try {
+        if (!paper_mode_ && use_python_clob_) {
+            return execute_via_clob_bridge(
+                token_id, price, size_shares, 0, is_neg_risk, false,
+                "", "", 0.0, "MANUAL", "", "",
+                order_type, intent, side_ask, side_bid, has_side_ask, has_side_bid);
+        }
         Order order = build_order(token_id, price, size_shares, 0);
         Signature sig = pick_signer(is_neg_risk).sign_order(order);
         if (paper_mode_) {
@@ -311,6 +477,17 @@ LegFillResult OrderRouter::execute_leg_buy(const std::string& token_id, double p
             if (r.success) {
                 r.price = price;
                 r.size_shares = size_shares;
+                r.post_order_type = order_type;
+                r.intent = intent;
+                risk::LihExecMeta tmp;
+                infer_shadow_exec_meta(tmp, price, side_ask, side_bid, order_type, intent);
+                r.trader_side = tmp.trader_side;
+                r.exec_class = tmp.exec_class;
+                r.side_ask_at_fill = tmp.side_ask_at_fill;
+                r.side_bid_at_fill = tmp.side_bid_at_fill;
+                r.price_vs_ask_cents = tmp.price_vs_ask_cents;
+                r.has_side_ask = tmp.has_side_ask;
+                r.has_side_bid = tmp.has_side_bid;
             }
             return r;
         }
@@ -401,7 +578,13 @@ LegFillResult OrderRouter::execute_via_clob_bridge(
     double end_date_ts,
     const std::string& strategy,
     const std::string& original_order_id,
-    const std::string& position_id_salt
+    const std::string& position_id_salt,
+    const std::string& order_type,
+    const std::string& intent,
+    double side_ask,
+    double side_bid,
+    bool has_side_ask,
+    bool has_side_bid
 ) {
     namespace beast = boost::beast;
     namespace http = beast::http;
@@ -413,6 +596,10 @@ LegFillResult OrderRouter::execute_via_clob_bridge(
     body["size_shares"] = size_shares;
     body["side"] = side == 0 ? "BUY" : "SELL";
     body["neg_risk"] = is_neg_risk;
+    body["order_type"] = order_type.empty() ? "FAK" : order_type;
+    if (!intent.empty()) body["intent"] = intent;
+    if (has_side_ask) body["side_ask"] = side_ask;
+    if (has_side_bid) body["side_bid"] = side_bid;
     const std::string payload = boost::json::serialize(body);
 
     try {
@@ -461,6 +648,7 @@ LegFillResult OrderRouter::execute_via_clob_bridge(
                     && result.size_shares > 0.0) {
                     result.success = true;
                     result.price = result.price > 0.0 ? result.price : price;
+                    parse_json_exec_meta(response_json, result);
                     if (!register_position) {
                         spdlog::info("[LIVE EXEC] Bridge fill | {} | {:.4f} x {:.4f}",
                                      asset, result.price, result.size_shares);
@@ -536,6 +724,7 @@ LegFillResult OrderRouter::execute_via_clob_bridge(
         result.price = actual_price;
         result.size_shares = filled_size;
         result.pending_fill = false;
+        parse_json_exec_meta(response_json, result);
 
         if (!register_position) {
             spdlog::info("[LIVE EXEC] Bridge fill | {} | {:.4f} x {:.4f}", asset, actual_price, filled_size);
@@ -1026,14 +1215,22 @@ namespace {
 
 double resize_for_ask_book(const BookAskInfo& book, double requested_shares) {
     if (!book.ok) return 0.0;
+    const double min_sh = book.min_order_size > kFloatTol ? book.min_order_size : 5.0;
     double try_shares = std::min(requested_shares, book.depth_shares / kDepthFillRatio);
-    while (try_shares >= kMinFillShares) {
+    while (try_shares + kFloatTol >= min_sh) {
         if (book.depth_shares + kFloatTol >= try_shares * kDepthFillRatio) {
             return try_shares;
         }
-        try_shares *= 0.5;
+        try_shares = std::floor(try_shares * 0.5 * 100.0 + 1e-9) / 100.0;
     }
     return 0.0;
+}
+
+bool live_fill_usable(double price, double fill_shares, double min_order_size) {
+    if (fill_shares + kFloatTol < kMinFillShares) return false;
+    if (!leg_meets_minimum(price, fill_shares)) return false;
+    (void)min_order_size;
+    return true;
 }
 
 } // namespace
@@ -1044,6 +1241,16 @@ void OrderRouter::abandon_lih_pending(const LihPendingFill& pending, const char*
         risk_manager_.end_lih_leg1_inflight(pending.market.asset, pending.market.window_minutes);
         break;
     case LegInAction::Kind::CompleteHedge:
+        if (!pending.lih_id.empty()) {
+            risk_manager_.end_lih_rebalance_inflight(pending.lih_id);
+        }
+        break;
+    case LegInAction::Kind::AddLeg1:
+        if (!pending.lih_id.empty()) {
+            risk_manager_.end_lih_rebalance_inflight(pending.lih_id);
+        }
+        break;
+    case LegInAction::Kind::UnwindLeg1:
         if (!pending.lih_id.empty()) {
             risk_manager_.end_lih_rebalance_inflight(pending.lih_id);
         }
@@ -1086,7 +1293,9 @@ bool OrderRouter::lih_has_live_pending(const LegInAction& act) const {
             continue;
         }
         if (!act.lih_id.empty() && pending.lih_id == act.lih_id &&
-            pending.kind == LegInAction::Kind::CompleteHedge) {
+            (pending.kind == LegInAction::Kind::CompleteHedge ||
+             pending.kind == LegInAction::Kind::AddLeg1 ||
+             pending.kind == LegInAction::Kind::UnwindLeg1)) {
             return true;
         }
     }
@@ -1145,6 +1354,49 @@ void OrderRouter::register_lih_from_pending(
         store_.push_signal(fmt::format(
             "LIH LIVE {} {} {} {:.2f}sh @ {:.4f} (pending resolved)",
             tag, pending.market.asset, side_label, reg_sh, fill.price));
+        spdlog::info("[LIVE LIH] {} pending resolved {} {:.2f}sh order_id={}",
+                     tag, pending.market.asset, reg_sh, pending.order_id);
+        break;
+    }
+    case LegInAction::Kind::AddLeg1: {
+        const char* tag = "CLIP";
+        if (pending.lih_id.empty()) {
+            spdlog::error("[LIVE LIH] pending {} missing lih_id order_id={}", tag, pending.order_id);
+            return;
+        }
+        risk_manager_.register_lih_add_leg(
+            pending.lih_id, pending.buy_yes, fill.price, fill.size_shares, false, true);
+        store_.push_signal(fmt::format(
+            "LIH LIVE {} {} {:.2f}sh @ {:.4f} (pending resolved)",
+            tag, side_label, fill.size_shares, fill.price));
+        spdlog::info("[LIVE LIH] {} pending resolved {} {:.2f}sh order_id={}",
+                     tag, pending.market.asset, fill.size_shares, pending.order_id);
+        break;
+    }
+    case LegInAction::Kind::UnwindLeg1: {
+        const char* tag = "UNWIND";
+        if (pending.lih_id.empty()) {
+            spdlog::error("[LIVE LIH] pending {} missing lih_id order_id={}", tag, pending.order_id);
+            return;
+        }
+        double reg_sh = fill.size_shares;
+        const auto open = risk_manager_.get_open_lih_positions();
+        const auto pit = open.find(pending.lih_id);
+        if (pit != open.end()) {
+            const double gap = std::abs(pit->second.yes_shares - pit->second.no_shares);
+            if (gap <= kFloatTol) {
+                spdlog::warn("[LIVE LIH] {} pending skip {} order_id={} — gap already 0",
+                             tag, pending.market.asset, pending.order_id);
+                return;
+            }
+            reg_sh = std::min(reg_sh, gap);
+        }
+        if (reg_sh <= kFloatTol) return;
+        risk_manager_.register_lih_unwind(
+            pending.lih_id, pending.buy_yes, fill.price, reg_sh, false, true);
+        store_.push_signal(fmt::format(
+            "LIH LIVE {} sell {} {:.2f}sh @ {:.4f} (pending resolved)",
+            tag, side_label, reg_sh, fill.price));
         spdlog::info("[LIVE LIH] {} pending resolved {} {:.2f}sh order_id={}",
                      tag, pending.market.asset, reg_sh, pending.order_id);
         break;
@@ -1232,11 +1484,15 @@ int OrderRouter::poll_lih_pending_fills(double now_sec) {
         }
         pending.last_poll_sec = now_sec;
 
-        LegFillResult fill = resolve_clob_fill(pending.token_id, pending.exec_px, pending.order_id, 0);
+        LegFillResult fill = resolve_clob_fill(
+            pending.token_id, pending.exec_px, pending.order_id,
+            pending.kind == LegInAction::Kind::UnwindLeg1 ? 1 : 0);
         if (fill.success && fill.size_shares >= kMinFillShares) {
             const auto open = risk_manager_.get_open_lih_positions();
             const auto pit = open.find(pending.lih_id);
-            if (pit != open.end() && pending.kind == LegInAction::Kind::CompleteHedge) {
+            if (pit != open.end()
+                && (pending.kind == LegInAction::Kind::CompleteHedge
+                    || pending.kind == LegInAction::Kind::UnwindLeg1)) {
                 const double gap = std::abs(pit->second.yes_shares - pit->second.no_shares);
                 if (gap <= kFloatTol) {
                     abandon_lih_pending(pending, "gap already closed");
@@ -1281,12 +1537,13 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
 
     const bool is_neg_risk = act.market.is_neg_risk;
     const double target = store_.lih_target_combined();
+    const double leg1_trigger_min = store_.lih_leg1_trigger_min();
+    const double leg1_trigger_max = store_.lih_leg1_trigger_max();
     const double leg1_max = store_.lih_leg1_trigger_mode()
-        ? 0.99
+        ? (leg1_trigger_max > 1e-6 ? leg1_trigger_max : 0.99)
         : (store_.lih_leg1_trend_mode()
             ? store_.lih_leg1_trend_max_price()
             : store_.lih_leg1_max_price());
-    const double leg1_trigger_min = store_.lih_leg1_trigger_min();
     const char* side_label = act.buy_yes ? "YES" : "NO";
 
     auto shadow = [&](const char* tag, const std::string& detail) {
@@ -1315,15 +1572,34 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
                              act.market.asset, exec_px, leg1_trigger_min);
                 return false;
             }
+            if (leg1_trigger_max > 1e-6 && exec_px > leg1_trigger_max + kFloatTol) {
+                spdlog::info("[LIVE LIH] LEG1 skip {} | ask {:.4f} > trigger_max {:.4f}",
+                             act.market.asset, exec_px, leg1_trigger_max);
+                return false;
+            }
         } else if (exec_px > leg1_max + kFloatTol) {
             spdlog::info("[LIVE LIH] LEG1 skip {} | ask {:.4f} > max {:.4f}",
                          act.market.asset, exec_px, leg1_max);
             return false;
         }
+        // Detector gates on cached REST; fill uses a fresh book fetch. Re-check the
+        // offhours floor on exec_px so stale cache cannot open lottery asks.
+        if (offhours_exec_ask_blocked(store_, act.market, exec_px)) {
+            spdlog::info(
+                "[LIVE LIH] LEG1 skip {} | offhours exec ask {:.4f} < min {:.4f} "
+                "(decision {:.4f})",
+                act.market.asset, exec_px, store_.mm2_offhours_min_ask(), act.price);
+            return false;
+        }
         double shares = resize_for_ask_book(book, act.shares);
+        const double min_sh = book.min_order_size > kFloatTol ? book.min_order_size : 5.0;
         if (shares + kFloatTol < act.shares) {
-            spdlog::info("[LIVE LIH] LEG1 skip {} — book depth {:.2f} < {:.2f} sh required",
-                         act.market.asset, shares, act.shares);
+            spdlog::info("[LIVE LIH] LEG1 resize {} {:.2f} -> {:.2f} sh (book depth)",
+                         act.market.asset, act.shares, shares);
+        }
+        if (shares + kFloatTol < min_sh) {
+            spdlog::info("[LIVE LIH] LEG1 skip {} — book depth {:.2f} < min {:.2f} sh",
+                         act.market.asset, shares, min_sh);
             return false;
         }
         if (!leg_meets_minimum(exec_px, shares)) {
@@ -1348,14 +1624,26 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
         }
 
         const std::string detail = fmt::format("{} {:.2f}sh @ {:.4f} ({})", side_label, shares, exec_px, act.note);
+        const std::string intent = lih_intent_for(act);
         if (live_lih_dry_run_) {
+            std::string post_type = "FAK";
+            double shadow_px = exec_px;
+            const std::string order_mode = store_.lih_leg1_order_mode();
+            if (order_mode == "gtc") {
+                const double tick = book.tick_size > kFloatTol ? book.tick_size : 0.01;
+                shadow_px = std::max(tick, book.best_ask - tick);
+                post_type = "GTC";
+            }
+            risk::LihExecMeta exec;
+            infer_shadow_exec_meta(exec, shadow_px, book.best_ask, 0.0, post_type, intent);
             risk_manager_.register_lih_open_leg1(
-                act.market, act.buy_yes, exec_px, shares, now_sec, true, false, true);
+                act.market, act.buy_yes, shadow_px, shares, now_sec, true, false, true, &exec);
             shadow("LEG1", detail);
             return true;
         }
 
-        LegFillResult fill = execute_leg_buy(tok, exec_px, shares, is_neg_risk);
+        LegFillResult fill = execute_leg_buy(
+            tok, exec_px, shares, is_neg_risk, "FAK", intent, book.best_ask, 0.0, true, false);
         if ((!fill.success || fill.size_shares < kMinFillShares) && use_python_clob_) {
             LegFillResult resolved = resolve_clob_fill(tok, exec_px, fill.order_id, 0);
             if (resolved.success && resolved.size_shares >= kMinFillShares) {
@@ -1372,23 +1660,83 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
                 act, tok, fill, exec_px, shares, now_sec, "LEG1")) {
             return false;
         }
-        if (!fill.success || fill.size_shares < kMinFillShares) {
+        if (!fill.success || !live_fill_usable(fill.price > 0 ? fill.price : exec_px, fill.size_shares, min_sh)) {
             risk_manager_.end_lih_leg1_inflight(act.market.asset, act.market.window_minutes);
             spdlog::error("[LIVE LIH] LEG1 buy failed {} (filled {:.4f})",
                           act.market.asset, fill.size_shares);
             return false;
         }
         if (fill.size_shares + kFloatTol < shares) {
-            risk_manager_.end_lih_leg1_inflight(act.market.asset, act.market.window_minutes);
-            spdlog::warn("[LIVE LIH] LEG1 partial {:.2f}/{:.2f} {} — rejected (no register)",
+            spdlog::info("[LIVE LIH] LEG1 partial {:.2f}/{:.2f} {} — accepting fill",
                          fill.size_shares, shares, act.market.asset);
-            return false;
         }
         drop_lih_pending_for(act);
         risk_manager_.register_lih_open_leg1(
             act.market, act.buy_yes, fill.price, fill.size_shares, now_sec, false);
         store_.push_signal(fmt::format("LIH LIVE LEG1 {} {} {:.2f}sh @ {:.4f} ({})",
             act.market.asset, side_label, fill.size_shares, fill.price, act.note));
+        return true;
+    }
+
+    case LegInAction::Kind::AddLeg1: {
+        const std::string& tok = act.buy_yes ? act.market.yes_token_id : act.market.no_token_id;
+        BookAskInfo book = fetch_book_ask_info(tok);
+        if (!book.ok) {
+            spdlog::warn("[LIVE LIH] CLIP {} — empty ask book", act.market.asset);
+            return false;
+        }
+        const double exec_px = book.best_ask;
+        if (!store_.lih_leg1_trigger_mode() && !store_.lih_leg1_trend_mode()) {
+            const double leg1_max = store_.lih_leg1_max_price();
+            if (exec_px > leg1_max + kFloatTol) {
+                spdlog::info("[LIVE LIH] CLIP skip {} | ask {:.4f} > max {:.4f}",
+                             act.market.asset, exec_px, leg1_max);
+                return false;
+            }
+        }
+        double shares = resize_for_ask_book(book, act.shares);
+        const double min_sh = book.min_order_size > kFloatTol ? book.min_order_size : 5.0;
+        if (shares + kFloatTol < min_sh || !leg_meets_minimum(exec_px, shares)) return false;
+        const double cost = shares * exec_px;
+        if (!risk_manager_.can_open_lih_leg(cost, true, &act.lih_id, shares).first) return false;
+        if (act.lih_id.empty() || !risk_manager_.try_begin_lih_rebalance(act.lih_id)) {
+            spdlog::warn("[LIVE LIH] CLIP blocked — in-flight or missing lih_id {}", act.lih_id);
+            return false;
+        }
+        const char* tag = "CLIP";
+        const std::string detail = fmt::format(
+            "{} {:.2f}sh @ {:.4f} ({})", side_label, shares, exec_px, act.note);
+        const std::string intent = lih_intent_for(act);
+        if (live_lih_dry_run_) {
+            risk::LihExecMeta exec;
+            infer_shadow_exec_meta(exec, exec_px, book.best_ask, 0.0, "FAK", intent);
+            risk_manager_.register_lih_add_leg(act.lih_id, act.buy_yes, exec_px, shares, true, false, &exec);
+            shadow(tag, detail);
+            return true;
+        }
+        if (lih_has_live_pending(act)) return false;
+        LegFillResult fill = execute_leg_buy(
+            tok, exec_px, shares, is_neg_risk, "FAK", intent, book.best_ask, 0.0, true, false);
+        if ((!fill.success || fill.size_shares < kMinFillShares) && use_python_clob_) {
+            LegFillResult resolved = resolve_clob_fill(tok, exec_px, fill.order_id, 0);
+            if (resolved.success && resolved.size_shares >= kMinFillShares) fill = resolved;
+        }
+        if (fill.pending_fill || lih_track_or_fail_live_order(
+                act, tok, fill, exec_px, shares, now_sec, tag)) {
+            return false;
+        }
+        if (!fill.success || !live_fill_usable(fill.price > 0 ? fill.price : exec_px, fill.size_shares, min_sh)) {
+            risk_manager_.end_lih_rebalance_inflight(act.lih_id);
+            return false;
+        }
+        if (fill.size_shares + kFloatTol < shares) {
+            spdlog::info("[LIVE LIH] CLIP partial {:.2f}/{:.2f} {} — accepting fill",
+                         fill.size_shares, shares, act.market.asset);
+        }
+        drop_lih_pending_for(act);
+        risk_manager_.register_lih_add_leg(act.lih_id, act.buy_yes, fill.price, fill.size_shares, false);
+        store_.push_signal(fmt::format("LIH LIVE {} {} {} {:.2f}sh @ {:.4f} ({})",
+            tag, act.market.asset, side_label, fill.size_shares, fill.price, act.note));
         return true;
     }
 
@@ -1411,9 +1759,14 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
                 const double heavy_avg = act.buy_yes ? no_avg : yes_avg;
                 if (heavy_avg > kFloatTol && !lih_action_is_force(act)) {
                     const double marginal = heavy_avg + exec_px;
-                    if (marginal > target + kFloatTol) {
-                        spdlog::info("[LIVE LIH] hedge skip {} | marginal {:.4f} > target {:.4f}",
-                                     act.market.asset, marginal, target);
+                    double cap = target;
+                    if (act.note.find("mid-soft") != std::string::npos) {
+                        const double mid = store_.lih_mid_soft_cap();
+                        if (mid > target + kFloatTol) cap = mid;
+                    }
+                    if (marginal > cap + kFloatTol) {
+                        spdlog::info("[LIVE LIH] hedge skip {} | marginal {:.4f} > cap {:.4f}",
+                                     act.market.asset, marginal, cap);
                         return false;
                     }
                 }
@@ -1421,13 +1774,14 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
         }
 
         double shares = resize_for_ask_book(book, act.shares);
+        const double min_sh = book.min_order_size > kFloatTol ? book.min_order_size : 5.0;
         if (shares + kFloatTol < act.shares) {
             spdlog::info("[LIVE LIH] HEDGE {} — book resize {:.2f} -> {:.2f} sh",
                          act.market.asset, act.shares, shares);
         }
-        if (shares < kMinFillShares) {
-            spdlog::warn("[LIVE LIH] HEDGE {} — depth not met for {:.2f} sh",
-                         act.market.asset, shares);
+        if (shares + kFloatTol < min_sh) {
+            spdlog::warn("[LIVE LIH] HEDGE {} — depth not met for {:.2f} sh (min {:.2f})",
+                         act.market.asset, shares, min_sh);
             return false;
         }
         if (!leg_meets_minimum(exec_px, shares)) return false;
@@ -1437,13 +1791,16 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
 
         const char* tag = "HEDGE";
         const std::string detail = fmt::format("{} {:.2f}sh @ {:.4f} ({})", side_label, shares, exec_px, act.note);
+        const std::string intent = lih_intent_for(act);
         if (live_lih_dry_run_) {
             if (act.lih_id.empty() || !risk_manager_.try_begin_lih_rebalance(act.lih_id)) {
                 spdlog::warn("[LIVE LIH] {} shadow blocked — rebalance in-flight or missing lih_id {}",
                              tag, act.lih_id);
                 return false;
             }
-            risk_manager_.register_lih_add_leg(act.lih_id, act.buy_yes, exec_px, shares, true, false);
+            risk::LihExecMeta exec;
+            infer_shadow_exec_meta(exec, exec_px, book.best_ask, 0.0, "FAK", intent);
+            risk_manager_.register_lih_add_leg(act.lih_id, act.buy_yes, exec_px, shares, true, false, &exec);
             shadow(tag, detail);
             return true;
         }
@@ -1458,9 +1815,88 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
             return false;
         }
 
-        LegFillResult fill = execute_leg_buy(tok, exec_px, shares, is_neg_risk);
+        LegFillResult fill = execute_leg_buy(
+            tok, exec_px, shares, is_neg_risk, "FAK", intent, book.best_ask, 0.0, true, false);
         if ((!fill.success || fill.size_shares < kMinFillShares) && use_python_clob_) {
             LegFillResult resolved = resolve_clob_fill(tok, exec_px, fill.order_id, 0);
+            if (resolved.success && resolved.size_shares >= kMinFillShares) {
+                fill = resolved;
+            } else if (!fill.order_id.empty() && resolved.order_id.empty()) {
+                resolved.order_id = fill.order_id;
+            }
+            if (!fill.success && !resolved.order_id.empty()) {
+                fill.order_id = resolved.order_id;
+                fill.pending_fill = true;
+            }
+        }
+        if (fill.pending_fill || lih_track_or_fail_live_order(
+                act, tok, fill, exec_px, shares, now_sec, tag)) {
+            return false;
+        }
+        if (!fill.success || !live_fill_usable(fill.price > 0 ? fill.price : exec_px, fill.size_shares, min_sh)) {
+            risk_manager_.end_lih_rebalance_inflight(act.lih_id);
+            spdlog::error("[LIVE LIH] {} failed {} (filled {:.4f}/{:.4f})",
+                          tag, act.market.asset, fill.size_shares, shares);
+            return false;
+        }
+        if (fill.size_shares + kFloatTol < shares) {
+            spdlog::info("[LIVE LIH] {} partial {:.2f}/{:.2f} {} — accepting fill",
+                         tag, fill.size_shares, shares, act.market.asset);
+        }
+        drop_lih_pending_for(act);
+        risk_manager_.register_lih_add_leg(act.lih_id, act.buy_yes, fill.price, fill.size_shares, false);
+        store_.push_signal(fmt::format("LIH LIVE {} {} {} {:.2f}sh @ {:.4f} ({})",
+            tag, act.market.asset, side_label, fill.size_shares, fill.price, act.note));
+        return true;
+    }
+
+    case LegInAction::Kind::UnwindLeg1: {
+        const std::string& tok = act.buy_yes ? act.market.yes_token_id : act.market.no_token_id;
+        BookBidInfo book = fetch_book_bid_info(tok);
+        if (!book.ok) {
+            spdlog::warn("[LIVE LIH] UNWIND {} — empty bid book", act.market.asset);
+            return false;
+        }
+        const double exec_px = book.best_bid;
+        double shares = act.shares;
+        if (shares < kMinFillShares) {
+            spdlog::warn("[LIVE LIH] UNWIND {} — size {:.2f} below minimum", act.market.asset, shares);
+            return false;
+        }
+        if (!leg_meets_minimum(exec_px, shares)) return false;
+
+        const char* tag = "UNWIND";
+        const std::string detail = fmt::format(
+            "sell {} {:.2f}sh @ {:.4f} ({})",
+            side_label, shares, exec_px, act.note);
+        if (live_lih_dry_run_) {
+            if (act.lih_id.empty() || !risk_manager_.try_begin_lih_rebalance(act.lih_id)) {
+                spdlog::warn("[LIVE LIH] {} shadow blocked — in-flight or missing lih_id {}",
+                             tag, act.lih_id);
+                return false;
+            }
+            if (!risk_manager_.register_lih_unwind(
+                    act.lih_id, act.buy_yes, exec_px, shares, true, false)) {
+                risk_manager_.end_lih_rebalance_inflight(act.lih_id);
+                return false;
+            }
+            shadow(tag, detail);
+            return true;
+        }
+
+        if (lih_has_live_pending(act)) {
+            spdlog::debug("[LIVE LIH] {} skip {} — pending order in flight", tag, act.market.asset);
+            return false;
+        }
+        if (act.lih_id.empty() || !risk_manager_.try_begin_lih_rebalance(act.lih_id)) {
+            spdlog::warn("[LIVE LIH] {} blocked — in-flight or missing lih_id {}",
+                         tag, act.lih_id);
+            return false;
+        }
+
+        LegFillResult fill = execute_unwind_sell(tok, exec_px, shares, is_neg_risk);
+        if ((!fill.success || fill.size_shares < kMinFillShares) && use_python_clob_) {
+            LegFillResult resolved = resolve_clob_fill(tok, exec_px, fill.order_id, 1);
             if (resolved.success && resolved.size_shares >= kMinFillShares) {
                 fill = resolved;
             } else if (!fill.order_id.empty() && resolved.order_id.empty()) {
@@ -1481,12 +1917,9 @@ bool OrderRouter::submit_lih_action(const trading::LegInAction& act, double now_
                           tag, act.market.asset, fill.size_shares, shares);
             return false;
         }
-        if (fill.size_shares + kFloatTol < shares) {
-            spdlog::warn("[LIVE LIH] {} partial {:.2f}/{:.2f} {} — accepting fill",
-                         tag, fill.size_shares, shares, act.market.asset);
-        }
         drop_lih_pending_for(act);
-        risk_manager_.register_lih_add_leg(act.lih_id, act.buy_yes, fill.price, fill.size_shares, false);
+        risk_manager_.register_lih_unwind(
+            act.lih_id, act.buy_yes, fill.price, fill.size_shares, false, true);
         store_.push_signal(fmt::format("LIH LIVE {} {} {} {:.2f}sh @ {:.4f} ({})",
             tag, act.market.asset, side_label, fill.size_shares, fill.price, act.note));
         return true;

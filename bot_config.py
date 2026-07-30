@@ -30,6 +30,13 @@ BOOL_KEYS = frozenset({
     "LIH_LEG1_TREND_ALIGN",
     "LIH_ENDGAME_MINIMIZE_GAP",
     "LIH_ENDGAME_LADDER_ENABLED",
+    "LIH_HEDGE_FEASIBLE_ENTRY",
+    "LIH_VWAP_ENTRY_GATE",
+    "LIH_PARALLEL_CLIP_HEDGE",
+    "LIH_UNWIND_ENABLED",
+    "LIH_OPEN_GAP",
+    "LIH_MM2_MODE",
+    "LIH_SKIP_PARTIAL_WINDOW_ON_START",
 })
 
 ALLOWED_KEYS = {
@@ -43,26 +50,65 @@ ALLOWED_KEYS = {
     "DH_ENABLE_15M_ETH",
     "LIH_USE_MIRROR",
     "LIVE_LIH_DRY_RUN",
+    "SHADOW_BANKROLL_USDC",
+    "SHADOW_WINDOW_LOG",
+    "SHADOW_WINDOW_ASSET",
+    "SHADOW_WINDOW_MINUTES",
     "LIH_LEG1_MAX_PRICE",
     "LIH_LEG1_MODE",
     "LIH_LEG1_TRIGGER_MIN",
+    "LIH_LEG1_TRIGGER_MAX",
+    "LIH_QUOTE_MODE",
     "LIH_LEG1_START_DELAY_SEC",
     "LIH_LEG1_TREND_ALIGN",
     "LIH_ENDGAME_SOFT_CAP",
+    "LIH_ENDGAME_SECS",
     "LIH_ENDGAME_OVERRIDE_SECS",
+    "LIH_ENDGAME_OVERRIDE_COOLDOWN",
     "LIH_ENDGAME_MINIMIZE_GAP",
     "LIH_ENDGAME_LADDER_ENABLED",
     "LIH_ENDGAME_LADDER_SECS",
     "LIH_ENDGAME_LADDER_START",
     "LIH_ENDGAME_LADDER_END",
+    "LIH_ENDGAME_LADDER_STEP",
     "LIH_MAX_ENTRY_MARGINAL",
     "LIH_TARGET_COMBINED",
+    "LIH_MID_SOFT_CAP",
+    "LIH_MID_SOFT_START_SECS",
+    "LIH_HEDGE_FEASIBLE_ENTRY",
+    "LIH_HEDGE_FEASIBLE_CAP",
+    "LIH_VWAP_ENTRY_GATE",
+    "LIH_VWAP_ENTRY_CAP",
+    "LIH_VWAP_DEPTH_RATIO",
+    "LIH_MIN_EDGE_USDC",
+    "LIH_MIN_EDGE_PER_SHARE",
+    "LIH_UNWIND_ENABLED",
+    "LIH_UNWIND_SECS",
+    "LIH_UNWIND_COOLDOWN",
     "LIH_MIN_SECONDS_REMAINING",
     "LIH_LEG1_MIN_SECONDS_REMAINING",
     "LIH_COOLDOWN_SECONDS",
     "LIH_LEG1_COOLDOWN_SECONDS",
     "LIH_REBALANCE_COOLDOWN_SECONDS",
     "LIH_LEG1_SHARES",
+    "LIH_LEG1_CLIP_SHARES",
+    "LIH_PARALLEL_CLIP_HEDGE",
+    "LIH_PARALLEL_HEDGE_MAX_COMBINED",
+    "LIH_EARLY_HEDGE_MAX_COMBINED",
+    "LIH_HEAVY_CLIP_SHARES",
+    "LIH_HEAVY_MAX_PRICE",
+    "LIH_MAX_GAP_SHARES",
+    "LIH_GAP_HEDGE_MAX_COMBINED",
+    "LIH_OPEN_GAP",
+    "LIH_MM2_MODE",
+    "LIH_MM2_MIN_SPOT_BPS",
+    "LIH_MM2_ENTRY_MAX_SECS_LEFT",
+    "LIH_MM2_ENTRY_MIN_SECS_LEFT",
+    "LIH_MM2_FAVORITE_MIN",
+    "LIH_MM2_HEAVY_DELAY_SEC",
+    "LIH_MM2_SCALE_CLIP",
+    "LIH_MM2_SCALE_AGAINST_STOP_BPS",
+    "LIH_SKIP_PARTIAL_WINDOW_ON_START",
     "LIH_MAX_REBALANCE_SHARES",
     "LIH_MAX_MATCHED_SHARES",
     "LIH_MAX_USDC_PER_SLOT",
@@ -178,12 +224,33 @@ def _validate_patch(patch: dict[str, Any]) -> dict[str, str]:
             "LIH_LEG1_COOLDOWN_SECONDS",
             "LIH_REBALANCE_COOLDOWN_SECONDS",
             "LIH_LEG1_SHARES",
+            "LIH_LEG1_CLIP_SHARES",
             "LIH_MAX_REBALANCE_SHARES",
             "LIH_MAX_MATCHED_SHARES",
             "LIH_FORCE_BALANCE_SECS",
             "LIH_FLEX_DILUTE_RATIO",
             "LIH_SESSION_MAX_LEGS",
             "LIH_MIN_BALANCE_USDC",
+            "SHADOW_BANKROLL_USDC",
+            "LIH_ENDGAME_SECS",
+            "LIH_ENDGAME_SOFT_CAP",
+            "LIH_ENDGAME_OVERRIDE_SECS",
+            "LIH_ENDGAME_OVERRIDE_COOLDOWN",
+            "LIH_ENDGAME_LADDER_SECS",
+            "LIH_ENDGAME_LADDER_START",
+            "LIH_ENDGAME_LADDER_END",
+            "LIH_ENDGAME_LADDER_STEP",
+            "LIH_MID_SOFT_CAP",
+            "LIH_MID_SOFT_START_SECS",
+            "LIH_HEDGE_FEASIBLE_CAP",
+            "LIH_VWAP_ENTRY_CAP",
+            "LIH_VWAP_DEPTH_RATIO",
+            "LIH_MIN_EDGE_USDC",
+            "LIH_MIN_EDGE_PER_SHARE",
+            "LIH_UNWIND_SECS",
+            "LIH_UNWIND_COOLDOWN",
+            "LIH_EARLY_HEDGE_MAX_COMBINED",
+            "LIH_PARALLEL_HEDGE_MAX_COMBINED",
             "FEE_RATE",
         ):
             num = _parse_float(text, key)
@@ -203,16 +270,43 @@ def _validate_patch(patch: dict[str, Any]) -> dict[str, str]:
                 "LIH_LEG1_MIN_SECONDS_REMAINING",
             ) and num < 0:
                 raise ValueError(f"{key} must be >= 0")
-            if key in ("LIH_LEG1_SHARES", "LIH_MAX_REBALANCE_SHARES", "LIH_MAX_MATCHED_SHARES") and num < 0:
+            if key in ("LIH_LEG1_SHARES", "LIH_LEG1_CLIP_SHARES", "LIH_MAX_REBALANCE_SHARES", "LIH_MAX_MATCHED_SHARES") and num < 0:
                 raise ValueError(f"{key} must be >= 0")
             if key == "LIH_MAX_USDC_PER_SLOT" and num < 0:
                 raise ValueError("LIH_MAX_USDC_PER_SLOT must be >= 0")
             if key == "LIH_FORCE_BALANCE_SECS" and num < 0:
                 raise ValueError(f"{key} must be >= 0")
+            if key in (
+                "LIH_ENDGAME_SECS",
+                "LIH_ENDGAME_OVERRIDE_SECS",
+                "LIH_ENDGAME_OVERRIDE_COOLDOWN",
+                "LIH_ENDGAME_LADDER_SECS",
+            ) and num < 0:
+                raise ValueError(f"{key} must be >= 0")
+            if key in (
+                "LIH_ENDGAME_SOFT_CAP",
+                "LIH_ENDGAME_LADDER_START",
+                "LIH_ENDGAME_LADDER_END",
+                "LIH_ENDGAME_LADDER_STEP",
+                "LIH_MID_SOFT_CAP",
+                "LIH_HEDGE_FEASIBLE_CAP",
+                "LIH_VWAP_ENTRY_CAP",
+            ) and not (0.0 < num <= 1.5):
+                raise ValueError(f"{key} must be 0-1.5")
+            if key == "LIH_VWAP_DEPTH_RATIO" and not (0.0 < num <= 1.0):
+                raise ValueError("LIH_VWAP_DEPTH_RATIO must be 0-1")
+            if key in ("LIH_MIN_EDGE_USDC", "LIH_MIN_EDGE_PER_SHARE") and num < 0:
+                raise ValueError(f"{key} must be >= 0")
+            if key in ("LIH_UNWIND_SECS", "LIH_UNWIND_COOLDOWN") and num < 0:
+                raise ValueError(f"{key} must be >= 0")
+            if key == "LIH_MID_SOFT_START_SECS" and num < 0:
+                raise ValueError(f"{key} must be >= 0")
             if key == "LIH_SESSION_MAX_LEGS" and (num < 0 or num > 20):
                 raise ValueError("LIH_SESSION_MAX_LEGS must be 0-20 (0 = unlimited)")
             if key == "LIH_MIN_BALANCE_USDC" and num < 0:
                 raise ValueError("LIH_MIN_BALANCE_USDC must be >= 0 (0 = off)")
+            if key == "SHADOW_BANKROLL_USDC" and num < 0:
+                raise ValueError("SHADOW_BANKROLL_USDC must be >= 0 (0 = use wallet)")
             if key == "LIH_FLEX_DILUTE_RATIO" and not (0.0 < num <= 1.0):
                 raise ValueError("LIH_FLEX_DILUTE_RATIO must be 0-1")
             text = str(num)

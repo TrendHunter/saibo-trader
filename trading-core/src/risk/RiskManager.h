@@ -12,6 +12,10 @@
 #include <mutex>
 #include <boost/json.hpp>
 
+namespace trading {
+class ShadowWindowRecorder;
+}
+
 namespace risk {
 
 enum class TradingStatus {
@@ -41,6 +45,20 @@ struct Position {
     bool paper_mode = true;
     double peak_price = 0.0;
     bool is_neg_risk = false; // true for Polymarket Up/Down (neg-risk) markets
+};
+
+/** mm2-tracker-v2 exec metadata for shadow_trades.jsonl (§3.7). */
+struct LihExecMeta {
+    std::string post_order_type = "FAK";
+    std::string trader_side;
+    std::string exec_class;
+    std::string intent;
+    std::string order_id;
+    double side_ask_at_fill = 0.0;
+    double side_bid_at_fill = 0.0;
+    double price_vs_ask_cents = 0.0;
+    bool has_side_ask = false;
+    bool has_side_bid = false;
 };
 
 struct LegInHedgePosition {
@@ -161,6 +179,10 @@ public:
     /** Minimum wallet USDC before opening a new LIH leg1 (0 = off). */
     void set_lih_min_balance_usdc(double v);
     double get_lih_min_balance_usdc() const;
+    /** Shadow dry-run: fixed bankroll (SHADOW_BANKROLL_USDC); skip wallet sync, apply PnL on close. */
+    void set_shadow_virtual_bankroll(bool v);
+    bool shadow_virtual_bankroll() const;
+    void set_shadow_window_recorder(trading::ShadowWindowRecorder* r);
 
     /** True if LEG1 CLOB submit is in-flight for asset+window (not open position). */
     bool lih_leg1_inflight_only(const std::string& asset, int window_minutes) const;
@@ -179,13 +201,18 @@ public:
     std::unordered_map<std::string, LegInHedgePosition> get_open_lih_positions() const;
     LegInHedgePosition register_lih_open_leg1(
         const trading::MarketInfo& market, bool buy_yes, double price, double shares, double now_sec,
-        bool is_paper = true, bool debit_balance = true, bool is_shadow = false);
+        bool is_paper = true, bool debit_balance = true, bool is_shadow = false,
+        const LihExecMeta* exec = nullptr);
     void register_lih_add_leg(
         const std::string& lih_id, bool buy_yes, double price, double shares, bool is_paper = true,
-        bool debit_balance = true);
+        bool debit_balance = true, const LihExecMeta* exec = nullptr);
     void register_lih_add_paired(
         const std::string& lih_id, double yes_price, double no_price, double shares, bool is_paper = true,
         bool debit_balance = true);
+    /** Sell heavy-leg gap at bid (Phase B unwind). Returns false if position missing. */
+    bool register_lih_unwind(
+        const std::string& lih_id, bool sell_yes, double bid_price, double shares,
+        bool is_paper = true, bool credit_balance = true);
     std::optional<LegInHedgePosition> register_lih_close(
         const std::string& lih_id,
         double yes_exit,
@@ -302,6 +329,10 @@ private:
     int lih_session_legs_used_ = 0;
     bool lih_pause_after_round_ = false;
     double lih_min_balance_usdc_ = 10.0;
+    bool shadow_virtual_bankroll_ = false;
+    trading::ShadowWindowRecorder* shadow_window_recorder_ = nullptr;
+    /** Shadow dry-run sizing base; never block leg1 when shadow_virtual_bankroll_. */
+    double shadow_sizing_balance_unlocked() const;
     void maybe_pause_after_lih_round(const std::string& trigger);
     double lih_slot_cap_usdc_unlocked() const;
     bool lih_other_slot_busy_unlocked(const std::string& asset, int window_minutes) const;

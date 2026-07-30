@@ -28,12 +28,24 @@ struct LegFillResult {
     std::string order_id;
     /** Order submitted but fill not confirmed — do not release in-flight locks. */
     bool pending_fill = false;
+    std::string post_order_type = "FAK";
+    std::string trader_side;
+    std::string exec_class;
+    std::string intent;
+    double side_ask_at_fill = 0.0;
+    double side_bid_at_fill = 0.0;
+    double price_vs_ask_cents = 0.0;
+    bool has_side_ask = false;
+    bool has_side_bid = false;
 };
 
 struct BookAskInfo {
     bool ok = false;
     double best_ask = 0.0;
     double depth_shares = 0.0;
+    /** From CLOB /book min_order_size (typically 5). */
+    double min_order_size = 5.0;
+    double tick_size = 0.01;
 };
 
 struct BookBidInfo {
@@ -89,6 +101,8 @@ public:
 
     // Sum of ask sizes at or below price * 1.02; -1 on fetch/parse failure.
     double query_ask_depth_shares(const std::string& token_id, double price);
+
+    BookBidInfo fetch_book_bid_info(const std::string& token_id);
 
     void submit_close_order(const std::string& order_id, const std::string& token_id, double current_price, double size, const std::string& asset, const std::string& question, double end_date_ts, const std::string& strategy, bool is_neg_risk = false);
 
@@ -167,7 +181,13 @@ private:
         double end_date_ts,
         const std::string& strategy,
         const std::string& original_order_id,
-        const std::string& position_id_salt
+        const std::string& position_id_salt,
+        const std::string& order_type = "FAK",
+        const std::string& intent = "",
+        double side_ask = 0.0,
+        double side_bid = 0.0,
+        bool has_side_ask = false,
+        bool has_side_bid = false
     );
     LegFillResult resolve_clob_fill(
         const std::string& token_id,
@@ -191,7 +211,12 @@ private:
 
     bool simulate_paper_order(const Order& order, const Signature& sig, const std::string& asset = "", const std::string& question = "", double end_date_ts = 0.0, const std::string& strategy = "MANUAL", const std::string& original_order_id = "", bool is_neg_risk = false, const std::string& direction = "");
 
-    LegFillResult execute_leg_buy(const std::string& token_id, double price, double size_shares, bool is_neg_risk);
+    LegFillResult execute_leg_buy(
+        const std::string& token_id, double price, double size_shares, bool is_neg_risk,
+        const std::string& order_type = "FAK",
+        const std::string& intent = "",
+        double side_ask = 0.0, double side_bid = 0.0,
+        bool has_side_ask = false, bool has_side_bid = false);
     LegFillResult execute_unwind_sell(const std::string& token_id, double price, double size_shares, bool is_neg_risk);
 
     std::optional<boost::json::object> fetch_book_object(const std::string& token_id);

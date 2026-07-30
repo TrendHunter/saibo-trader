@@ -5,3 +5,10 @@ DEPLOY_SSH_PASSWORD="your-vps-root-password"
 # DEPLOY_HOST=70.34.221.132
 # DEPLOY_USER=root
 # DEPLOY_PROJ=/opt/polymarket-bot
+
+# Local boot sync (scripts/local_boot_sync.ps1):
+# 1. Pull bot shadow logs from VPS (incremental)
+# 2. Refresh data/mm2_session_active.json from m2/YYYY-MM-DD/
+# 3. Push session JSON + latest m2 pack to VPS (updates P4 session gate)
+# mm2/m3 day packs: export from polycopy recorder → copy into repo m2/ m3/
+# Bot VPS runs 24h; session table stays on last push until you boot PC and sync again.

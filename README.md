@@ -125,6 +125,49 @@ trading-core (C++)
 
 ---
 
+## mm2 对齐 Shadow（当前实验，2026-07）
+
+VPS shadow 主路径是 **`LIH_LEG1_MODE=mm2`**（对照外部 tracker `m2` 包），不是上面的 trigger 基线。目标：少做 bot 独有的垃圾窗，提高同窗率。
+
+### 术语
+
+| 词 | 含义 |
+|----|------|
+| **同窗** | 同一 `window_start_ts`，bot 与 m2 **都开了** |
+| **bot-only** | bot 开了、m2 没开（多为筛窗过宽：session_off / flat_book / 过早 cheap 等） |
+| **m2-only** | m2 开了、bot 没开（漏信号 / 门禁过严 / 数据缺口） |
+
+盈利差经常集中在 **only**：那是「该不该做这窗」的分歧；同窗差才是选边/执行差。
+
+### 已上线（shadow，默认 dry-run）
+
+| 步骤 | 开关 | 作用 |
+|------|------|------|
+| **session 对齐** | `LIH_MM2_SESSION_FROM_OBS=true` | 只在 m2 `session_active` 小时开；skip：`mm2 session off` |
+| **early YES 补洞** | `LIH_MM2_EARLY_YES_GUARD=true` | early 选 YES 须 **YES 本身是 favorite** 且 `yes≥0.65`、`spread≥0.35`（旧版用 `max(yes,no)`，cheap YES 会漏过） |
+| **fav-early B** | `LIH_MM2_FAV_EARLY_BYPASS=true` | 时钟门前偏热门旁路；见 [`docs/mm2-fav-early-bypass.md`](docs/mm2-fav-early-bypass.md) |
+
+阈值复用：`LIH_MM2_EARLY_TILT_MIN_SPREAD=0.35`、`LIH_MM2_EARLY_TILT_MIN_FAV=0.65`。Session 小时来自 `m2/YYYY-MM-DD/windows.jsonl` 或 `data/mm2_session_active.json`（`scripts/mm2_session_refresh.py`）。
+
+### Shadow markers（VPS `shadow_trades.jsonl`）
+
+| Marker | 内容 |
+|--------|------|
+| `bot-fav-early-bypass-b-20260727` | fav-early B |
+| `bot-early-yes-guard-bprime-20260728` | 旧 B′（洞未补） |
+| `bot-early-yes-guard-bprime-sessionalign-20260729` | + session 对齐（前 20 单约 **+111**，旧同口径约 **-112**） |
+| `bot-early-yes-holefix-sessionalign-20260730` | **当前**：session + YES 补洞（攒样本中） |
+
+### 下一步（先观察，不叠刀）
+
+1. 攒当前 marker 样本（建议 ≥20–30 单）再 bot↔m2 同窗对比  
+2. 候选下一刀：`flat_book` 对齐、early **NO** 收紧、m2-only 漏窗  
+3. 拉包：`python scripts/pull_tracker_packs.py --accounts m2 --latest 3`；观测：`python scripts/_pull_vps_observation_data.py --marker <marker>`
+
+分析备忘：`data/compare_triple/bprime_vs_sessionalign_compare.txt`、`early_yes_holefix_deploy_note.txt`（本地，可不入库）。
+
+---
+
 ## VPS 裸跑部署（当前生产，与服务器一致）
 
 默认路径 **`/opt/polymarket-bot`**。
@@ -239,7 +282,10 @@ python start_bot.py
 | `.env.example` | Bot 策略 / 钱包（trigger nosoft 基线） |
 | `web.env.example` | Web 登录 / NEXTAUTH |
 | `docs/LIH_VERSION.md` | LIH 版本与 env 基线 |
+| `docs/mm2-fav-early-bypass.md` | fav-early 旁路说明 |
 | `scripts/README.md` | 运维 / shadow / 一次性脚本索引 |
+| `scripts/pull_tracker_packs.py` | 从 VPS 拉 m2/m3/m4 日包 |
+| `scripts/mm2_session_refresh.py` | 刷新 `mm2_session_active.json` |
 | `server_start_bot.sh` / `server_start_web.sh` | VPS 启动脚本 |
 | `build-lowmem.sh` | 低内存编译 |
 | `scripts/deploy_production.py` | **一键部署** bot + web → VPS |

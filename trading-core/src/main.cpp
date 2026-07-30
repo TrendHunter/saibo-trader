@@ -12,10 +12,13 @@
 #include <algorithm>
 #include "state/StateStore.h"
 #include "feeds/BinanceFeed.h"
+#include "feeds/ChainlinkFeed.h"
 #include "feeds/PolymarketFeed.h"
 #include "feeds/GammaClient.h"
 #include "risk/RiskManager.h"
 #include "signals/LegInHedgeDetector.h"
+#include "signals/RegimeGate.h"
+#include "telemetry/ShadowWindowRecorder.h"
 #include "exec/OrderRouter.h"
 #include "state/PaperStateStore.h"
 #include <spdlog/sinks/basic_file_sink.h>
@@ -289,6 +292,7 @@ static bool verify_venv_web3() {
 
 // --- 4. 实盘余额同步：调用 fetch_balance.py 刷新 RiskManager 当前余额 ---
 static void sync_live_balance(risk::RiskManager& risk_manager) {
+    if (risk_manager.shadow_virtual_bankroll()) return;
     const std::string out = popen_read_first_line(python_script_cmd("fetch_balance.py", "", false));
     if (out.empty()) return;
     try {
@@ -383,12 +387,18 @@ static double paper_action_extra_slip(const StateStore& store, const LegInAction
     if (act.kind == LegInAction::Kind::OpenLeg1) {
         return store.paper_leg1_extra_slip_pct();
     }
+    if (act.kind == LegInAction::Kind::AddLeg1) {
+        return store.paper_leg1_extra_slip_pct();
+    }
     if (act.kind == LegInAction::Kind::CompleteHedge) {
         double extra = store.paper_hedge_extra_slip_pct();
         if (act.note.find("force") != std::string::npos) {
             extra += store.paper_force_extra_slip_pct();
         }
         return extra;
+    }
+    if (act.kind == LegInAction::Kind::UnwindLeg1) {
+        return store.paper_hedge_extra_slip_pct();
     }
     return 0.0;
 }
@@ -776,11 +786,22 @@ static void apply_runtime_config(
                     std::lock_guard<std::mutex> lock(detector_mutex);
                     if (lih_detector) lih_detector->set_leg1_start_delay_sec(x);
                     store.push_telemetry(fmt::format("CONFIG LIH_LEG1_START_DELAY_SEC={}", v));
+                } else if (k == "LIH_SKIP_PARTIAL_WINDOW_ON_START") {
+                    const bool enabled = env_flag_true({{k, v}}, k, true);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_skip_partial_window_on_start(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_SKIP_PARTIAL_WINDOW_ON_START={}",
+                        enabled ? "true" : "false"));
                 } else if (k == "LIH_LEG1_SHARES") {
                     const double x = std::stod(v);
                     std::lock_guard<std::mutex> lock(detector_mutex);
                     if (lih_detector) lih_detector->set_leg1_shares(x);
                     store.push_telemetry(fmt::format("CONFIG LIH_LEG1_SHARES={}", v));
+                } else if (k == "LIH_LEG1_CLIP_SHARES") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_leg1_clip_shares(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_LEG1_CLIP_SHARES={}", v));
                 } else if (k == "LIH_ALLOW_OVER_TARGET") {
                     const bool enabled = parse_config_bool(v);
                     std::lock_guard<std::mutex> lock(detector_mutex);
@@ -801,19 +822,34 @@ static void apply_runtime_config(
                     std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
                     const bool trigger = (mode == "trigger");
                     const bool trend = (mode == "trend" || mode == "expensive");
-                    store.set_lih_leg1_mode(trigger ? "trigger" : (trend ? "trend" : "cheap"));
+                    const bool mm2 = (mode == "mm2");
+                    store.set_lih_leg1_mode(mm2 ? "mm2" : (trigger ? "trigger" : (trend ? "trend" : "cheap")));
                     std::lock_guard<std::mutex> lock(detector_mutex);
                     if (lih_detector) {
                         lih_detector->set_leg1_trigger_mode(trigger);
                         lih_detector->set_leg1_trend_mode(trend);
+                        lih_detector->set_mm2_mode(mm2);
                     }
-                    store.push_telemetry(fmt::format("CONFIG LIH_LEG1_MODE={}", trigger ? "trigger" : (trend ? "trend" : "cheap")));
+                    store.push_telemetry(fmt::format("CONFIG LIH_LEG1_MODE={}",
+                        mm2 ? "mm2" : (trigger ? "trigger" : (trend ? "trend" : "cheap"))));
                 } else if (k == "LIH_LEG1_TRIGGER_MIN") {
                     const double x = std::stod(v);
                     store.set_lih_leg1_trigger_min(x);
                     std::lock_guard<std::mutex> lock(detector_mutex);
                     if (lih_detector) lih_detector->set_leg1_trigger_min(x);
                     store.push_telemetry(fmt::format("CONFIG LIH_LEG1_TRIGGER_MIN={}", v));
+                } else if (k == "LIH_LEG1_TRIGGER_MAX") {
+                    const double x = std::stod(v);
+                    store.set_lih_leg1_trigger_max(x);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_leg1_trigger_max(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_LEG1_TRIGGER_MAX={}", v));
+                } else if (k == "LIH_QUOTE_MODE") {
+                    std::string mode = v;
+                    std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+                    if (mode != "rest" && mode != "conservative") mode = "conservative";
+                    store.set_lih_quote_mode(mode);
+                    store.push_telemetry(fmt::format("CONFIG LIH_QUOTE_MODE={}", mode));
                 } else if (k == "LIH_LEG1_TREND_MAX_PRICE") {
                     const double x = std::stod(v);
                     store.set_lih_leg1_trend_max_price(x);
@@ -861,6 +897,374 @@ static void apply_runtime_config(
                     std::lock_guard<std::mutex> lock(detector_mutex);
                     if (lih_detector) lih_detector->set_max_entry_marginal(x);
                     store.push_telemetry(fmt::format("CONFIG LIH_MAX_ENTRY_MARGINAL={}", v));
+                } else if (k == "LIH_MID_SOFT_CAP") {
+                    const double x = std::stod(v);
+                    store.set_lih_mid_soft_cap(x);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mid_soft_cap(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MID_SOFT_CAP={}", v));
+                } else if (k == "LIH_MID_SOFT_START_SECS") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mid_soft_start_secs(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MID_SOFT_START_SECS={}", v));
+                } else if (k == "LIH_HEDGE_FEASIBLE_ENTRY") {
+                    const bool enabled = env_flag_true({{k, v}}, k, false);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_hedge_feasible_entry(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_HEDGE_FEASIBLE_ENTRY={}",
+                        enabled ? "true" : "false"));
+                } else if (k == "LIH_HEDGE_FEASIBLE_CAP") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_hedge_feasible_cap(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_HEDGE_FEASIBLE_CAP={}", v));
+                } else if (k == "LIH_VWAP_ENTRY_GATE") {
+                    const bool enabled = env_flag_true({{k, v}}, k, false);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_vwap_entry_gate(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_VWAP_ENTRY_GATE={}",
+                        enabled ? "true" : "false"));
+                } else if (k == "LIH_VWAP_ENTRY_CAP") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_vwap_entry_cap(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_VWAP_ENTRY_CAP={}", v));
+                } else if (k == "LIH_VWAP_DEPTH_RATIO") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_vwap_depth_ratio(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_VWAP_DEPTH_RATIO={}", v));
+                } else if (k == "LIH_MIN_EDGE_USDC") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_min_edge_usdc(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MIN_EDGE_USDC={}", v));
+                } else if (k == "LIH_MIN_EDGE_PER_SHARE") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_min_edge_per_share(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MIN_EDGE_PER_SHARE={}", v));
+                } else if (k == "LIH_UNWIND_ENABLED") {
+                    const bool enabled = env_flag_true({{k, v}}, k, true);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_unwind_enabled(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_UNWIND_ENABLED={}",
+                        enabled ? "true" : "false"));
+                } else if (k == "LIH_UNWIND_SECS") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_unwind_secs(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_UNWIND_SECS={}", v));
+                } else if (k == "LIH_UNWIND_COOLDOWN") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_unwind_cooldown(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_UNWIND_COOLDOWN={}", v));
+                } else if (k == "LIH_PARALLEL_CLIP_HEDGE") {
+                    const bool enabled = env_flag_true({{k, v}}, k, false);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_parallel_clip_hedge(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_PARALLEL_CLIP_HEDGE={}",
+                        enabled ? "true" : "false"));
+                } else if (k == "LIH_PARALLEL_HEDGE_MAX_COMBINED") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_parallel_hedge_max_combined(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_PARALLEL_HEDGE_MAX_COMBINED={}", v));
+                } else if (k == "LIH_EARLY_HEDGE_MAX_COMBINED") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_early_hedge_max_combined(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_EARLY_HEDGE_MAX_COMBINED={}", v));
+                } else if (k == "LIH_OPEN_GAP") {
+                    const bool enabled = env_flag_true({{k, v}}, k, false);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_open_gap_mode(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_OPEN_GAP={}",
+                        enabled ? "true" : "false"));
+                } else if (k == "LIH_HEAVY_CLIP_SHARES") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_heavy_clip_shares(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_HEAVY_CLIP_SHARES={}", v));
+                } else if (k == "LIH_HEAVY_MAX_PRICE") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_heavy_max_price(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_HEAVY_MAX_PRICE={}", v));
+                } else if (k == "LIH_MAX_GAP_SHARES") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_max_gap_shares(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MAX_GAP_SHARES={}", v));
+                } else if (k == "LIH_GAP_HEDGE_MAX_COMBINED") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_gap_hedge_max_combined(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_GAP_HEDGE_MAX_COMBINED={}", v));
+                } else if (k == "LIH_HEDGE_MIN_GAP_TRIGGER") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_hedge_min_gap_trigger(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_HEDGE_MIN_GAP_TRIGGER={}", v));
+                } else if (k == "LIH_HEDGE_TARGET_MIN_GAP") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_hedge_target_min_gap(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_HEDGE_TARGET_MIN_GAP={}", v));
+                } else if (k == "LIH_LEG1_ORDER_MODE") {
+                    std::string mode = v;
+                    std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+                    store.set_lih_leg1_order_mode(mode);
+                    store.push_telemetry(fmt::format("CONFIG LIH_LEG1_ORDER_MODE={}", mode));
+                } else if (k == "LIH_MM2_MODE") {
+                    const bool enabled = parse_config_bool(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_mode(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_MODE={}",
+                        enabled ? "true" : "false"));
+                } else if (k == "LIH_MM2_MIN_SPOT_BPS") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_min_spot_bps(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_MIN_SPOT_BPS={}", v));
+                } else if (k == "LIH_MM2_ENTRY_MAX_SECS_LEFT") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_entry_max_secs_left(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_ENTRY_MAX_SECS_LEFT={}", v));
+                } else if (k == "LIH_MM2_ENTRY_MIN_SECS_LEFT") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_entry_min_secs_left(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_ENTRY_MIN_SECS_LEFT={}", v));
+                } else if (k == "LIH_MM2_FAVORITE_MIN") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_favorite_min_px(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_FAVORITE_MIN={}", v));
+                } else if (k == "LIH_MM2_SOFT_SPOT_BPS") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_soft_spot_bps(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_SOFT_SPOT_BPS={}", v));
+                } else if (k == "LIH_MM2_LATE_TILT_MIN_ASK") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_late_tilt_min_ask(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_LATE_TILT_MIN_ASK={}", v));
+                } else if (k == "LIH_MM2_LATE_TILT_MIN_SPREAD") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_late_tilt_min_spread(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_LATE_TILT_MIN_SPREAD={}", v));
+                } else if (k == "LIH_MM2_HEAVY_DELAY_SEC") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_heavy_delay_sec(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_HEAVY_DELAY_SEC={}", v));
+                } else if (k == "LIH_MM2_SCALE_CLIP") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_scale_clip_shares(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_SCALE_CLIP={}", v));
+                } else if (k == "LIH_MM2_HEAVY_MAX_SHARES") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_heavy_max_shares(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_HEAVY_MAX_SHARES={}", v));
+                } else if (k == "LIH_MM2_SCALE_BOOST") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_scale_boost(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_SCALE_BOOST={}", v));
+                } else if (k == "LIH_MM2_SCALE_AGAINST_STOP_BPS") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_scale_against_stop_bps(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_SCALE_AGAINST_STOP_BPS={}", v));
+                } else if (k == "LIH_MM2_HF1E_LATCH_GAP") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_hf1e_latch_gap(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_HF1E_LATCH_GAP={}", v));
+                } else if (k == "LIH_MM2_HF1E_LATCH_SECS_LEFT") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_hf1e_latch_secs_left(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_HF1E_LATCH_SECS_LEFT={}", v));
+                } else if (k == "LIH_MM2_HEDGE_BOOST") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_hedge_boost(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_HEDGE_BOOST={}", v));
+                } else if (k == "LIH_MM2_EARLY_ENTRY_MAX_SECS_LEFT") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_early_entry_max_secs_left(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_EARLY_ENTRY_MAX_SECS_LEFT={}", v));
+                } else if (k == "LIH_MM2_EARLY_TILT_MIN_SPREAD") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_early_tilt_min_spread(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_EARLY_TILT_MIN_SPREAD={}", v));
+                } else if (k == "LIH_MM2_EARLY_TILT_MIN_FAV") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_early_tilt_min_fav(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_EARLY_TILT_MIN_FAV={}", v));
+                } else if (k == "LIH_MM2_EARLY_YES_GUARD") {
+                    const bool on = (v == "1" || v == "true" || v == "TRUE" || v == "yes");
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_early_yes_guard(on);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_EARLY_YES_GUARD={}",
+                        on ? "true" : "false"));
+                } else if (k == "LIH_MM2_FAV_EARLY_BYPASS") {
+                    const bool on = (v == "1" || v == "true" || v == "TRUE" || v == "yes");
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_fav_early_bypass(on);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_FAV_EARLY_BYPASS={}",
+                        on ? "true" : "false"));
+                } else if (k == "LIH_MM2_FAV_EARLY_MODE") {
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_fav_early_mode(v);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_FAV_EARLY_MODE={}", v));
+                } else if (k == "LIH_MM2_FAV_EARLY_FAV_LO") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_fav_early_fav_lo(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_FAV_EARLY_FAV_LO={}", v));
+                } else if (k == "LIH_MM2_FAV_EARLY_FAV_HI") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_fav_early_fav_hi(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_FAV_EARLY_FAV_HI={}", v));
+                } else if (k == "LIH_MM2_FAV_EARLY_MIN_SPREAD") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_fav_early_min_spread(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_FAV_EARLY_MIN_SPREAD={}", v));
+                } else if (k == "LIH_MM2_FAV_EARLY_MIN_DTILT") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_fav_early_min_dtilt(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_FAV_EARLY_MIN_DTILT={}", v));
+                } else if (k == "LIH_MM2_MAIN_BJ_START") {
+                    const int x = std::stoi(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) {
+                        lih_detector->set_mm2_main_bj_hours(x, lih_detector->mm2_main_bj_end());
+                    }
+                    store.set_mm2_secondary_gates(
+                        x, store.mm2_main_bj_end(), store.mm2_offhours_min_ask());
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_MAIN_BJ_START={}", v));
+                } else if (k == "LIH_MM2_MAIN_BJ_END") {
+                    const int x = std::stoi(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) {
+                        lih_detector->set_mm2_main_bj_hours(lih_detector->mm2_main_bj_start(), x);
+                    }
+                    store.set_mm2_secondary_gates(
+                        store.mm2_main_bj_start(), x, store.mm2_offhours_min_ask());
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_MAIN_BJ_END={}", v));
+                } else if (k == "LIH_MM2_OFFHOURS_MIN_ASK") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_offhours_min_ask(x);
+                    store.set_mm2_secondary_gates(
+                        store.mm2_main_bj_start(), store.mm2_main_bj_end(), x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_OFFHOURS_MIN_ASK={}", v));
+                } else if (k == "LIH_MM2_MIN_SIDE_DEPTH") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_min_side_depth(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_MIN_SIDE_DEPTH={}", v));
+                } else if (k == "LIH_MM2_MIN_SIDE_DEPTH_MAIN_ONLY") {
+                    const bool x = (v == "1" || v == "true" || v == "TRUE" || v == "yes");
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_min_side_depth_main_only(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_MIN_SIDE_DEPTH_MAIN_ONLY={}", v));
+                } else if (k == "LIH_MM2_VOL_GATE") {
+                    const bool enabled = env_flag_true({{k, v}}, k, false);
+                    if (lih_detector) lih_detector->set_mm2_vol_gate(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_VOL_GATE={}",
+                        enabled ? "true" : "false"));
+                } else if (k == "LIH_MM2_V2J_ADAPTIVE") {
+                    const bool enabled = env_flag_true({{k, v}}, k, false);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_v2j_adaptive(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_V2J_ADAPTIVE={}",
+                        enabled ? "true" : "false"));
+                } else if (k == "LIH_MM2_V2J_MOM_LOOKBACK_SEC") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_v2j_mom_lookback_sec(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_V2J_MOM_LOOKBACK_SEC={}", v));
+                } else if (k == "LIH_MM2_V2J_MOM_FAV_MAX_ASK") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_v2j_mom_fav_max_ask(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_V2J_MOM_FAV_MAX_ASK={}", v));
+                } else if (k == "LIH_MM2_V2J_SPREAD_MIN") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_v2j_spread_min(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_V2J_SPREAD_MIN={}", v));
+                } else if (k == "LIH_MM2_V2J_SPREAD_FAV_MAX_ASK") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_v2j_spread_fav_max_ask(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_V2J_SPREAD_FAV_MAX_ASK={}", v));
+                } else if (k == "LIH_MM2_TILT_ENTRY") {
+                    const bool enabled = (v == "1" || v == "true" || v == "TRUE" || v == "yes");
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_tilt_entry(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_TILT_ENTRY={}",
+                                                     enabled ? "true" : "false"));
+                } else if (k == "LIH_MM2_TILT_DELTA") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_tilt_delta(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_TILT_DELTA={}", v));
+                } else if (k == "LIH_MM2_TILT_SIDE_FOLLOW") {
+                    const bool enabled = (v == "1" || v == "true" || v == "TRUE" || v == "yes");
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_tilt_side_follow(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_TILT_SIDE_FOLLOW={}",
+                                                     enabled ? "true" : "false"));
+                } else if (k == "LIH_MM2_CHEAPER_LATER") {
+                    const bool enabled = (v == "1" || v == "true" || v == "TRUE" || v == "yes");
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_cheaper_later(enabled);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_CHEAPER_LATER={}",
+                                                     enabled ? "true" : "false"));
+                } else if (k == "LIH_MM2_SPOT_LEG1_MAX_USDC") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_spot_leg1_max_usdc(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_SPOT_LEG1_MAX_USDC={}", v));
+                } else if (k == "LIH_MM2_SPOT_HEAVY_MAX_USDC") {
+                    const double x = std::stod(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) lih_detector->set_mm2_spot_heavy_max_usdc(x);
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_SPOT_HEAVY_MAX_USDC={}", v));
+                } else if (k == "LIH_MM2_SESSION_UTC_START") {
+                    const int x = std::stoi(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) {
+                        lih_detector->set_mm2_session_utc_hours(
+                            x, lih_detector->mm2_session_utc_end());
+                    }
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_SESSION_UTC_START={}", v));
+                } else if (k == "LIH_MM2_SESSION_UTC_END") {
+                    const int x = std::stoi(v);
+                    std::lock_guard<std::mutex> lock(detector_mutex);
+                    if (lih_detector) {
+                        lih_detector->set_mm2_session_utc_hours(
+                            lih_detector->mm2_session_utc_start(), x);
+                    }
+                    store.push_telemetry(fmt::format("CONFIG LIH_MM2_SESSION_UTC_END={}", v));
                 } else if (k == "LIH_MAX_REBALANCE_SHARES") {
                     const double x = std::stod(v);
                     std::lock_guard<std::mutex> lock(detector_mutex);
@@ -968,6 +1372,12 @@ int main() {
         bool auto_redeem = !paper_mode && env_flag_true(env, "AUTO_REDEEM", true);
         bool live_lih_dry_run = !paper_mode && env_flag_true(env, "LIVE_LIH_DRY_RUN", true);
         bool use_python_clob = !paper_mode && env_flag_true(env, "USE_PYTHON_CLOB", true);
+        const double shadow_bankroll_usdc = env_double_or(env, "SHADOW_BANKROLL_USDC", 0.0);
+        const double wallet_balance_usdc = starting_balance;
+        const bool shadow_virtual_bankroll = live_lih_dry_run && shadow_bankroll_usdc > 0.0;
+        if (shadow_virtual_bankroll) {
+            starting_balance = shadow_bankroll_usdc;
+        }
         std::string clob_bridge_host = env.count("CLOB_BRIDGE_HOST") ? env["CLOB_BRIDGE_HOST"] : "127.0.0.1";
         int clob_bridge_port = env.count("CLOB_BRIDGE_PORT") ? std::stoi(env["CLOB_BRIDGE_PORT"]) : 8081;
         std::string clob_bridge_path = env.count("CLOB_BRIDGE_PATH") ? env["CLOB_BRIDGE_PATH"] : "/internal/clob/order";
@@ -975,11 +1385,16 @@ int main() {
         const int lih_chain_reconcile_sec = env_int(env, "LIH_CHAIN_RECONCILE_SEC", 10, 5, 600);
         const int gamma_market_refresh_sec = env_int(env, "GAMMA_MARKET_REFRESH_SEC", 5, 3, 120);
 
+        if (shadow_virtual_bankroll) {
+            spdlog::info("Shadow virtual bankroll ${:.2f} (wallet ${:.2f}, wallet sync off)",
+                           starting_balance, wallet_balance_usdc);
+        }
         spdlog::info("Starting Core v3.0 (LIH) | Mode: {} | Bal: ${:.2f} | Auto-redeem: {} | LIH dry-run: {} | wallet_sync={}s | gamma_refresh={}s",
                      live_lih_dry_run ? "SHADOW" : "LIVE", starting_balance,
                      auto_redeem ? "on" : "off",
                      live_lih_dry_run ? "on" : "off",
-                     wallet_sync_interval_sec, gamma_market_refresh_sec);
+                     shadow_virtual_bankroll ? 0 : wallet_sync_interval_sec,
+                     gamma_market_refresh_sec);
 
         // --- E. 网络 IO 上下文：Feed 线程（Binance/Polymarket WS）与 Gamma REST ---
         boost::asio::io_context feed_ioc;
@@ -1006,8 +1421,9 @@ int main() {
         double lih_target_combined = env.count("LIH_TARGET_COMBINED") ? std::stod(env["LIH_TARGET_COMBINED"]) : 0.94;
         double lih_min_secs = env.count("LIH_MIN_SECONDS_REMAINING") ? std::stod(env["LIH_MIN_SECONDS_REMAINING"]) : 15.0;
         double lih_leg1_min_secs = env.count("LIH_LEG1_MIN_SECONDS_REMAINING")
-            ? std::stod(env["LIH_LEG1_MIN_SECONDS_REMAINING"]) : 30.0;
+            ? std::stod(env["LIH_LEG1_MIN_SECONDS_REMAINING"]) : 60.0;
         double lih_leg1_start_delay = env_double_or(env, "LIH_LEG1_START_DELAY_SEC", 5.0);
+        bool lih_skip_partial_window = env_flag_true(env, "LIH_SKIP_PARTIAL_WINDOW_ON_START", true);
         double lih_leg1_cooldown = 20.0;
         double lih_rebalance_cooldown = 5.0;
         if (env.count("LIH_LEG1_COOLDOWN_SECONDS")) {
@@ -1019,6 +1435,7 @@ int main() {
             lih_rebalance_cooldown = std::stod(env["LIH_REBALANCE_COOLDOWN_SECONDS"]);
         }
         double lih_leg1_shares = env.count("LIH_LEG1_SHARES") ? std::stod(env["LIH_LEG1_SHARES"]) : 10.0;
+        double lih_leg1_clip_shares = env_double_or(env, "LIH_LEG1_CLIP_SHARES", 0.0);
         bool lih_allow_over_target = env_flag_true(env, "LIH_ALLOW_OVER_TARGET", true);
         double lih_force_balance_secs = env.count("LIH_FORCE_BALANCE_SECS")
             ? std::stod(env["LIH_FORCE_BALANCE_SECS"]) : 60.0;
@@ -1049,6 +1466,12 @@ int main() {
         const bool lih_leg1_trend_mode = (lih_leg1_mode == "trend" || lih_leg1_mode == "expensive");
         double lih_leg1_trend_max = env_double_or(env, "LIH_LEG1_TREND_MAX_PRICE", 0.65);
         double lih_leg1_trigger_min = env_double_or(env, "LIH_LEG1_TRIGGER_MIN", 0.70);
+        double lih_leg1_trigger_max = env_double_or(env, "LIH_LEG1_TRIGGER_MAX", 0.0);
+        std::string lih_quote_mode = env.count("LIH_QUOTE_MODE") ? env["LIH_QUOTE_MODE"] : "conservative";
+        std::transform(lih_quote_mode.begin(), lih_quote_mode.end(), lih_quote_mode.begin(), ::tolower);
+        if (lih_quote_mode != "rest" && lih_quote_mode != "conservative") {
+            lih_quote_mode = "conservative";
+        }
         double lih_endgame_secs = env.count("LIH_ENDGAME_SECS")
             ? std::stod(env["LIH_ENDGAME_SECS"]) : 100.0;
         double lih_endgame_hold_ask = env_double_or(env, "LIH_ENDGAME_HOLD_ASK", 0.90);
@@ -1066,16 +1489,171 @@ int main() {
         double lih_endgame_ladder_end = env_double_or(env, "LIH_ENDGAME_LADDER_END", 0.97);
         double lih_endgame_ladder_step = env_double_or(env, "LIH_ENDGAME_LADDER_STEP", 0.01);
         double lih_max_entry_marginal = env_double_or(env, "LIH_MAX_ENTRY_MARGINAL", 1.15);
+        double lih_mid_soft_cap = env_double_or(env, "LIH_MID_SOFT_CAP", 0.0);
+        double lih_mid_soft_start_secs = env_double_or(env, "LIH_MID_SOFT_START_SECS", 300.0);
+        bool lih_hedge_feasible_entry = env_flag_true(env, "LIH_HEDGE_FEASIBLE_ENTRY", false);
+        double lih_hedge_feasible_cap = env_double_or(env, "LIH_HEDGE_FEASIBLE_CAP", 0.0);
+        bool lih_vwap_entry_gate = env_flag_true(env, "LIH_VWAP_ENTRY_GATE", false);
+        double lih_vwap_entry_cap = env_double_or(env, "LIH_VWAP_ENTRY_CAP", 0.0);
+        double lih_vwap_depth_ratio = env_double_or(env, "LIH_VWAP_DEPTH_RATIO", 0.90);
+        double lih_min_edge_usdc = env_double_or(env, "LIH_MIN_EDGE_USDC", 0.0);
+        double lih_min_edge_per_share = env_double_or(env, "LIH_MIN_EDGE_PER_SHARE", 0.05);
+        bool lih_unwind_enabled = env_flag_true(env, "LIH_UNWIND_ENABLED", true);
+        double lih_unwind_secs = env_double_or(env, "LIH_UNWIND_SECS", 120.0);
+        double lih_unwind_cooldown = env_double_or(env, "LIH_UNWIND_COOLDOWN", 10.0);
+        bool lih_parallel_clip_hedge = env_flag_true(env, "LIH_PARALLEL_CLIP_HEDGE", false);
+        double lih_parallel_hedge_max_combined = env_double_or(env, "LIH_PARALLEL_HEDGE_MAX_COMBINED", 1.0);
+        double lih_early_hedge_max_combined = env_double_or(env, "LIH_EARLY_HEDGE_MAX_COMBINED", 0.0);
+        bool lih_open_gap = env_flag_true(env, "LIH_OPEN_GAP", false);
+        double lih_heavy_clip_shares = env_double_or(env, "LIH_HEAVY_CLIP_SHARES", 100.0);
+        double lih_heavy_max_price = env_double_or(env, "LIH_HEAVY_MAX_PRICE", 0.75);
+        double lih_max_gap_shares = env_double_or(env, "LIH_MAX_GAP_SHARES", 0.0);
+        double lih_gap_hedge_max_combined = env_double_or(env, "LIH_GAP_HEDGE_MAX_COMBINED", 0.0);
+        bool lih_mm2_mode = env_flag_true(env, "LIH_MM2_MODE", false);
+        if (lih_leg1_mode == "mm2") lih_mm2_mode = true;
+        double lih_mm2_min_spot_bps = env_double_or(env, "LIH_MM2_MIN_SPOT_BPS", 0.0);
+        double lih_mm2_entry_max_secs_left = env_double_or(env, "LIH_MM2_ENTRY_MAX_SECS_LEFT", 180.0);
+        double lih_mm2_entry_min_secs_left = env_double_or(env, "LIH_MM2_ENTRY_MIN_SECS_LEFT", 20.0);
+        double lih_mm2_favorite_min = env_double_or(env, "LIH_MM2_FAVORITE_MIN", 0.48);
+        double lih_mm2_soft_spot_bps = env_double_or(env, "LIH_MM2_SOFT_SPOT_BPS", 0.0);
+        double lih_mm2_late_tilt_min_ask = env_double_or(env, "LIH_MM2_LATE_TILT_MIN_ASK", 0.0);
+        double lih_mm2_late_tilt_min_spread = env_double_or(env, "LIH_MM2_LATE_TILT_MIN_SPREAD", 0.15);
+        double lih_mm2_heavy_delay_sec = env_double_or(env, "LIH_MM2_HEAVY_DELAY_SEC", 40.0);
+        double lih_mm2_scale_clip = env_double_or(env, "LIH_MM2_SCALE_CLIP", 10.0);
+        double lih_mm2_heavy_max_shares = env_double_or(env, "LIH_MM2_HEAVY_MAX_SHARES", 0.0);
+        double lih_mm2_scale_boost = env_double_or(env, "LIH_MM2_SCALE_BOOST", 1.0);
+        double lih_mm2_scale_against_stop_bps =
+            env_double_or(env, "LIH_MM2_SCALE_AGAINST_STOP_BPS", 0.0);
+        double lih_mm2_hf1e_latch_gap = env_double_or(env, "LIH_MM2_HF1E_LATCH_GAP", 0.0);
+        double lih_mm2_hf1e_latch_secs_left =
+            env_double_or(env, "LIH_MM2_HF1E_LATCH_SECS_LEFT", 100.0);
+        double lih_mm2_hedge_boost = env_double_or(env, "LIH_MM2_HEDGE_BOOST", 1.0);
+        double lih_mm2_early_entry_max = env_double_or(env, "LIH_MM2_EARLY_ENTRY_MAX_SECS_LEFT", 0.0);
+        double lih_mm2_early_tilt_spread = env_double_or(env, "LIH_MM2_EARLY_TILT_MIN_SPREAD", 0.35);
+        double lih_mm2_early_tilt_fav = env_double_or(env, "LIH_MM2_EARLY_TILT_MIN_FAV", 0.65);
+        bool lih_mm2_early_yes_guard = env_flag_true(env, "LIH_MM2_EARLY_YES_GUARD", false);
+        int lih_mm2_main_bj_start = env.count("LIH_MM2_MAIN_BJ_START")
+            ? std::stoi(env.at("LIH_MM2_MAIN_BJ_START")) : 8;
+        int lih_mm2_main_bj_end = env.count("LIH_MM2_MAIN_BJ_END")
+            ? std::stoi(env.at("LIH_MM2_MAIN_BJ_END")) : 17;
+        double lih_mm2_offhours_min_ask = env_double_or(env, "LIH_MM2_OFFHOURS_MIN_ASK", 0.0);
+        double lih_mm2_min_side_depth = env_double_or(env, "LIH_MM2_MIN_SIDE_DEPTH", 0.0);
+        bool lih_mm2_min_side_depth_main_only =
+            env_flag_true(env, "LIH_MM2_MIN_SIDE_DEPTH_MAIN_ONLY", true);
+        double lih_mm2_spot_leg1_max_usdc = env_double_or(env, "LIH_MM2_SPOT_LEG1_MAX_USDC", 0.0);
+        double lih_mm2_spot_heavy_max_usdc = env_double_or(env, "LIH_MM2_SPOT_HEAVY_MAX_USDC", 0.0);
+        bool lih_mm2_align = env_flag_true(env, "LIH_MM2_ALIGN", false);
+        std::string lih_leg1_order_mode = env.count("LIH_LEG1_ORDER_MODE") ? env["LIH_LEG1_ORDER_MODE"] : "taker";
+        std::transform(lih_leg1_order_mode.begin(), lih_leg1_order_mode.end(), lih_leg1_order_mode.begin(), ::tolower);
+        double lih_hedge_min_gap_trigger = env_double_or(env, "LIH_HEDGE_MIN_GAP_TRIGGER", 0.0);
+        double lih_hedge_target_min_gap = env_double_or(env, "LIH_HEDGE_TARGET_MIN_GAP", 0.0);
+        int lih_mm2_session_utc_start = -1;
+        int lih_mm2_session_utc_end = -1;
+        if (env.count("LIH_MM2_SESSION_UTC_START")) {
+            lih_mm2_session_utc_start = std::stoi(env.at("LIH_MM2_SESSION_UTC_START"));
+        }
+        if (env.count("LIH_MM2_SESSION_UTC_END")) {
+            lih_mm2_session_utc_end = std::stoi(env.at("LIH_MM2_SESSION_UTC_END"));
+        }
+        bool lih_mm2_session_from_obs = env_flag_true(env, "LIH_MM2_SESSION_FROM_OBS", false);
+        std::string lih_mm2_session_file = env.count("LIH_MM2_SESSION_FILE")
+            ? env["LIH_MM2_SESSION_FILE"] : "data/mm2_session_active.json";
+        const bool lih_mm2_session_explicit = env.count("LIH_MM2_SESSION_FILE")
+            || lih_mm2_session_utc_start >= 0
+            || lih_mm2_session_utc_end >= 0;
+        bool lih_mm2_skip_flat = env_flag_true(env, "LIH_MM2_SKIP_FLAT", false);
+        double lih_mm2_flat_max_spot_bps = env_double_or(env, "LIH_MM2_FLAT_MAX_SPOT_BPS", 0.5);
+        double lih_mm2_flat_max_ask_sum = env_double_or(env, "LIH_MM2_FLAT_MAX_ASK_SUM", 0.0);
+        bool lih_mm2_vol_gate = env_flag_true(env, "LIH_MM2_VOL_GATE", false);
+        double lih_mm2_vol_min_spot_bps = env_double_or(env, "LIH_MM2_VOL_MIN_SPOT_BPS", 0.0);
+        double lih_mm2_vol_max_spot_bps = env_double_or(env, "LIH_MM2_VOL_MAX_SPOT_BPS", 0.0);
+        double lih_mm2_vol_max_spot_std = env_double_or(env, "LIH_MM2_VOL_MAX_SPOT_STD", 0.0);
+        bool lih_mm2_v2j_adaptive = env_flag_true(env, "LIH_MM2_V2J_ADAPTIVE", false);
+        double lih_mm2_v2j_mom_lookback = env_double_or(env, "LIH_MM2_V2J_MOM_LOOKBACK_SEC", 60.0);
+        double lih_mm2_v2j_mom_fav_max = env_double_or(env, "LIH_MM2_V2J_MOM_FAV_MAX_ASK", 0.60);
+        double lih_mm2_v2j_spread_min = env_double_or(env, "LIH_MM2_V2J_SPREAD_MIN", 0.12);
+        double lih_mm2_v2j_spread_fav_max = env_double_or(env, "LIH_MM2_V2J_SPREAD_FAV_MAX_ASK", 0.58);
+        bool lih_mm2_tilt_entry = env_flag_true(env, "LIH_MM2_TILT_ENTRY", false);
+        double lih_mm2_tilt_delta = env_double_or(env, "LIH_MM2_TILT_DELTA", 0.25);
+        bool lih_mm2_tilt_side_follow = env_flag_true(env, "LIH_MM2_TILT_SIDE_FOLLOW", false);
+        bool lih_mm2_cheaper_later = env_flag_true(env, "LIH_MM2_CHEAPER_LATER", false);
+        // Fav-early clock bypass (research gate B/C). Default OFF — enable only in shadow.
+        bool lih_mm2_fav_early_bypass = env_flag_true(env, "LIH_MM2_FAV_EARLY_BYPASS", false);
+        std::string lih_mm2_fav_early_mode = env.count("LIH_MM2_FAV_EARLY_MODE")
+            ? env["LIH_MM2_FAV_EARLY_MODE"] : "B";
+        double lih_mm2_fav_early_fav_lo = env_double_or(env, "LIH_MM2_FAV_EARLY_FAV_LO", 0.52);
+        double lih_mm2_fav_early_fav_hi = env_double_or(env, "LIH_MM2_FAV_EARLY_FAV_HI", 0.65);
+        double lih_mm2_fav_early_min_spread = env_double_or(env, "LIH_MM2_FAV_EARLY_MIN_SPREAD", 0.15);
+        double lih_mm2_fav_early_min_dtilt = env_double_or(env, "LIH_MM2_FAV_EARLY_MIN_DTILT", 0.10);
+        bool lih_mm2_obs_skip_from_pack = env_flag_true(env, "LIH_MM2_OBS_SKIP_FROM_PACK", false);
+        std::string lih_mm2_obs_m2_root = env.count("LIH_MM2_OBS_M2_ROOT")
+            ? env["LIH_MM2_OBS_M2_ROOT"] : "m2";
+        // Follow m2 leg1 cue from pack (side + timing); hedge still bot LIH.
+        bool lih_mm2_replay_leg1 = env_flag_true(env, "LIH_MM2_REPLAY_LEG1", false);
+        double lih_mm2_replay_lag_tol = env_double_or(env, "LIH_MM2_REPLAY_LAG_TOL_SEC", 15.0);
+        if (lih_mm2_replay_leg1) {
+            // Replay replaces session/flat/obs entry gates; keep hedge mm2 params.
+            lih_mm2_session_from_obs = false;
+            lih_mm2_obs_skip_from_pack = false;
+            lih_mm2_skip_flat = false;
+        }
+        if (lih_mm2_align || lih_mm2_mode) {
+            lih_open_gap = true;
+            if (!env.count("LIH_MAX_GAP_SHARES")) lih_max_gap_shares = 150.0;
+            if (!env.count("LIH_GAP_HEDGE_MAX_COMBINED")) lih_gap_hedge_max_combined = 1.05;
+            if (!env.count("LIH_FORCE_BALANCE_SECS")) lih_force_balance_secs = 0.0;
+            if (!env.count("LIH_ENDGAME_MINIMIZE_GAP")) lih_endgame_minimize_gap = false;
+            if (!env.count("LIH_ALLOW_OVER_TARGET")) lih_allow_over_target = false;
+            if (!env.count("LIH_HEDGE_MIN_GAP_TRIGGER")) lih_hedge_min_gap_trigger = 90.0;
+            if (!env.count("LIH_HEDGE_TARGET_MIN_GAP")) lih_hedge_target_min_gap = 144.0;
+        }
+        if (lih_mm2_align) {
+            if (!env.count("LIH_LEG1_ORDER_MODE")) lih_leg1_order_mode = "gtc";
+        }
+        if (lih_mm2_mode) {
+            if (!env.count("LIH_MM2_ENTRY_MAX_SECS_LEFT")) lih_mm2_entry_max_secs_left = 180.0;
+            if (!env.count("LIH_MM2_ENTRY_MIN_SECS_LEFT")) lih_mm2_entry_min_secs_left = 45.0;
+            if (!env.count("LIH_MM2_FAVORITE_MIN")) lih_mm2_favorite_min = 0.08;
+            if (!env.count("LIH_MM2_MIN_SPOT_BPS")) lih_mm2_min_spot_bps = 8.0;
+            // Session UTC gate is opt-in only (LIH_MM2_SESSION_UTC_*); bot runs 24h — compare mm2 via same-window overlap.
+        }
+        if (lih_open_gap) {
+            lih_parallel_clip_hedge = true;
+        }
+        bool regime_gate_enabled = env_flag_true(env, "REGIME_GATE_ENABLED", false);
+        double regime_thresh_b = env_double_or(env, "REGIME_THRESH_B", 0.75);
+        double regime_thresh_c = env_double_or(env, "REGIME_THRESH_C", 0.70);
+        double regime_b_jump_bps = env_double_or(env, "REGIME_B_JUMP_BPS", 25.0);
+        double regime_b_window_bps = env_double_or(env, "REGIME_B_WINDOW_BPS", 40.0);
+        double regime_c_ask_sum_bad = env_double_or(env, "REGIME_C_ASK_SUM_BAD", 0.015);
+        double regime_c_min_depth = env_double_or(env, "REGIME_C_MIN_DEPTH", 50.0);
+        double regime_hedge_margin = env_double_or(env, "REGIME_HEDGE_MARGIN", 0.03);
+        int regime_pre_cooldown_sec = static_cast<int>(env_double_or(env, "REGIME_PRE_COOLDOWN_SEC", 1800.0));
+        int regime_pre_extend_sec = static_cast<int>(env_double_or(env, "REGIME_PRE_EXTEND_SEC", 900.0));
+        int regime_pre_max_sec = static_cast<int>(env_double_or(env, "REGIME_PRE_MAX_SEC", 7200.0));
+        std::string regime_pre_state_file = env.count("REGIME_STATE_FILE")
+            ? env["REGIME_STATE_FILE"] : "data/regime/regime_pre.json";
         std::string mirror_path = env.count("LIVE_MIRROR_PATH") ? env["LIVE_MIRROR_PATH"] : "logs/live_mirror.json";
 
         const std::string strategy = "leg_in";
 
         // --- H. Market feeds & optional depth/slippage sim (legacy) ---
-        bool binance_feed_enabled = true;
+        // Spot for LIH/mm2: Chainlink via Polymarket RTDS (settlement oracle). Binance off by default.
+        bool chainlink_feed_enabled = true;
+        if (env.count("CHAINLINK_FEED_ENABLED")) {
+            std::string cf = env["CHAINLINK_FEED_ENABLED"];
+            std::transform(cf.begin(), cf.end(), cf.begin(), ::tolower);
+            chainlink_feed_enabled = !(cf == "false" || cf == "0" || cf == "no" || cf == "off");
+        }
+        bool binance_feed_enabled = false;
         if (env.count("BINANCE_FEED_ENABLED")) {
             std::string bf = env["BINANCE_FEED_ENABLED"];
             std::transform(bf.begin(), bf.end(), bf.begin(), ::tolower);
             binance_feed_enabled = !(bf == "false" || bf == "0" || bf == "no" || bf == "off");
+        }
+        if (chainlink_feed_enabled && binance_feed_enabled) {
+            spdlog::warn("CHAINLINK + BINANCE both enabled — preferring Chainlink (settlement), disabling Binance");
+            binance_feed_enabled = false;
         }
         bool book_aware_detect = env.count("BOOK_AWARE_DETECT")
             ? env_flag_true(env, "BOOK_AWARE_DETECT", true)
@@ -1095,11 +1673,13 @@ int main() {
         const double paper_hedge_extra_slip = env_double_or(env, "PAPER_HEDGE_EXTRA_SLIP_PCT", 0.012);
         const double paper_force_extra_slip = env_double_or(env, "PAPER_FORCE_EXTRA_SLIP_PCT", 0.03);
 
-        spdlog::info("Strategy: {} | LIH: on | max_pos={:.0f}% | Binance chart: {} | Book-aware: {}",
-                     strategy,
-                     max_pos * 100.0,
-                     binance_feed_enabled ? "on" : "off",
-                     book_aware_detect ? "on" : "off");
+        spdlog::info(
+            "Strategy: {} | LIH: on | max_pos={:.0f}% | Chainlink spot: {} | Binance: {} | Book-aware: {}",
+            strategy,
+            max_pos * 100.0,
+            chainlink_feed_enabled ? "on" : "off",
+            binance_feed_enabled ? "on" : "off",
+            book_aware_detect ? "on" : "off");
         if (paper_mode) {
             spdlog::info("Paper pricing | official CLOB book: {} | slippage: {:.2f}% | depth sim: {}",
                          paper_official_book ? "on" : "off", paper_slippage_pct * 100.0,
@@ -1124,14 +1704,17 @@ int main() {
                 ? fmt::format("${:.2f}", lih_max_usdc_per_slot)
                 : "balance×pos_frac";
             spdlog::info(
-                "LIH config | leg1_mode={} leg1<={:.2f} trigger>={:.2f} trend_max<={:.2f} target<={:.2f} entry={:.1f} "
+                "LIH config | leg1_mode={} quote={} leg1<={:.2f} trigger>={:.2f} trigger_max<={:.2f} trend_max<={:.2f} target<={:.2f} entry={:.1f} "
                 "leg1_delay={:.0f}s mode={} dilute={:.2f} "
                 "leg1_min={:.0f}s hedge_min={:.0f}s force={:.0f}s trend_align={} lookback={:.0f}s "
                 "endgame={:.0f}s hold>={:.2f} soft_cap={:.2f} step={:.0f}/{:.0f} override={:.0f}s "
                 "leg1_cd={} rebal_cd={} max_rebal_sh={} max_matched_sh={} slot_cap={} "
                 "pause_after_round={} session_legs={}",
-                lih_leg1_trigger_mode ? "trigger" : (lih_leg1_trend_mode ? "trend" : "cheap"),
-                lih_leg1_max, lih_leg1_trigger_min, lih_leg1_trend_max, lih_target_combined, lih_leg1_shares, lih_leg1_start_delay,
+                lih_leg1_trigger_mode ? "trigger" : (lih_leg1_trend_mode ? "trend" : (lih_mm2_mode ? "mm2" : "cheap")),
+                lih_quote_mode.c_str(),
+                lih_leg1_max, lih_leg1_trigger_min,
+                lih_leg1_trigger_max > 1e-6 ? lih_leg1_trigger_max : 0.0,
+                lih_leg1_trend_max, lih_target_combined, lih_leg1_shares, lih_leg1_start_delay,
                 lih_flex_rebalance ? "flex" : "standard",
                 lih_flex_dilute_ratio,
                 lih_leg1_min_secs, lih_min_secs,
@@ -1171,6 +1754,12 @@ int main() {
         risk_manager.set_lih_session_max_legs(lih_session_max_legs);
         risk_manager.set_lih_pause_after_round(lih_pause_after_round);
         risk_manager.set_lih_min_balance_usdc(lih_min_balance_usdc);
+        if (shadow_virtual_bankroll) {
+            risk_manager.set_shadow_virtual_bankroll(true);
+            store.push_telemetry(fmt::format(
+                "SHADOW bankroll ${:.0f} (wallet ${:.2f}, sync off)",
+                shadow_bankroll_usdc, wallet_balance_usdc));
+        }
         if (!paper_mode && lih_min_balance_usdc > 0.0 &&
             starting_balance + 1e-6 < lih_min_balance_usdc) {
             spdlog::warn("[LIH] Wallet ${:.2f} below LIH_MIN_BALANCE_USDC=${:.2f} — new leg1 blocked until topped up",
@@ -1191,6 +1780,9 @@ int main() {
                 spdlog::info("Live LIH state: fresh session (no snapshot at {})", live_state_path);
             }
             risk_manager.purge_paper_positions();
+        }
+        if (shadow_virtual_bankroll) {
+            risk_manager.set_live_starting_balance(shadow_bankroll_usdc);
         }
         int legacy_la = risk_manager.close_legacy_la_positions();
         if (legacy_la > 0) {
@@ -1239,9 +1831,14 @@ int main() {
         store.set_paper_force_extra_slip_pct(paper_force_extra_slip);
         store.set_lih_enabled(true);
         store.set_lih_config(lih_leg1_max, lih_target_combined, lih_use_mirror);
-        store.set_lih_leg1_mode(lih_leg1_trigger_mode ? "trigger" : (lih_leg1_trend_mode ? "trend" : "cheap"));
+        store.set_lih_mid_soft_cap(lih_mid_soft_cap);
+        store.set_lih_leg1_mode(lih_mm2_mode ? "mm2"
+            : (lih_leg1_trigger_mode ? "trigger" : (lih_leg1_trend_mode ? "trend" : "cheap")));
         store.set_lih_leg1_trend_max_price(lih_leg1_trend_max);
         store.set_lih_leg1_trigger_min(lih_leg1_trigger_min);
+        store.set_lih_leg1_trigger_max(lih_leg1_trigger_max);
+        store.set_lih_leg1_order_mode(lih_leg1_order_mode);
+        store.set_lih_quote_mode(lih_quote_mode);
         store.set_live_lih_dry_run(live_lih_dry_run);
         store.set_mirror_path(mirror_path);
         if (env.count("LIVE_TRADES_BASELINE_TS")) {
@@ -1254,8 +1851,12 @@ int main() {
         // --- N. OrderRouter: live CLOB (NegRisk dual signer) ---
         exec::OrderRouter router(feed_ioc, feed_ctx, store, risk_manager, polymarket_host, polymarket_chain_id, verifying_contract, polymarket_pk, polymarket_signer, polymarket_funder, paper_mode, poly_api_key, poly_api_secret, poly_api_passphrase, neg_risk_exchange, live_lih_dry_run, use_python_clob, clob_bridge_host, clob_bridge_port, clob_bridge_path);
 
-        // --- O. 外部客户端：Gamma（市场列表/结算/REST 兜底）+ Binance WS ---
+        // --- O. 外部客户端：Gamma + Chainlink RTDS（结算同源）+ 可选 Binance ---
         GammaClient gamma(gamma_ioc, gamma_ctx);
+        std::shared_ptr<ChainlinkFeed> chainlink_feed;
+        if (chainlink_feed_enabled) {
+            chainlink_feed = std::make_shared<ChainlinkFeed>(feed_ioc, feed_ctx, store);
+        }
         std::shared_ptr<BinanceFeed> btc_feed;
         std::shared_ptr<BinanceFeed> eth_feed;
         std::shared_ptr<BinanceFeed> sol_feed;
@@ -1271,6 +1872,37 @@ int main() {
         // --- P. 策略检测器：LegInHedge（分腿 LIH）---
         std::mutex detector_mutex;
         std::unique_ptr<LegInHedgeDetector> lih_detector;
+        const bool shadow_window_log =
+            live_lih_dry_run && env_flag_true(env, "SHADOW_WINDOW_LOG", true);
+        std::unique_ptr<ShadowWindowRecorder> shadow_window_recorder;
+        std::unique_ptr<RegimeGate> regime_gate;
+        if (regime_gate_enabled) {
+            regime_gate = std::make_unique<RegimeGate>();
+            regime_gate->set_enabled(true);
+            regime_gate->set_store(&store);
+            regime_gate->configure(
+                regime_thresh_b, regime_thresh_c, lih_mm2_min_spot_bps, lih_target_combined,
+                regime_b_jump_bps, regime_b_window_bps, regime_c_ask_sum_bad, regime_c_min_depth,
+                regime_hedge_margin, regime_pre_cooldown_sec, regime_pre_extend_sec,
+                regime_pre_max_sec, regime_pre_state_file);
+            spdlog::info(
+                "RegimeGate enabled | B>={:.2f} C>={:.2f} pre_file={}",
+                regime_thresh_b, regime_thresh_c, regime_pre_state_file);
+        }
+        if (shadow_window_log) {
+            shadow_window_recorder = std::make_unique<ShadowWindowRecorder>();
+            shadow_window_recorder->set_enabled(true);
+            shadow_window_recorder->set_store(&store);
+            std::string sw_asset = env.count("SHADOW_WINDOW_ASSET") ? env["SHADOW_WINDOW_ASSET"] : "btc";
+            std::transform(sw_asset.begin(), sw_asset.end(), sw_asset.begin(), ::tolower);
+            const int sw_minutes = env.count("SHADOW_WINDOW_MINUTES")
+                ? std::stoi(env["SHADOW_WINDOW_MINUTES"]) : 5;
+            shadow_window_recorder->set_asset_filter(sw_asset, sw_minutes);
+            risk_manager.set_shadow_window_recorder(shadow_window_recorder.get());
+            spdlog::info(
+                "Shadow window ledger on | asset={} {}m -> logs/shadow_windows.jsonl",
+                sw_asset, sw_minutes);
+        }
 
         // LIH actions: OrderRouter on live; legacy local sim path if paper_mode
         auto execute_lih_action = [&](const LegInAction& act, double now_sec) {
@@ -1285,31 +1917,30 @@ int main() {
             auto slip_buy = [&](double px) {
                 return apply_paper_slippage(px, true, paper_slippage_pct);
             };
+            auto slip_sell = [&](double px, const LegInAction& a) {
+                return apply_paper_slippage(px, false, paper_slippage_pct + paper_action_extra_slip(store, a));
+            };
             constexpr double kLihMinUsdc = 1.0;
             switch (act.kind) {
             case LegInAction::Kind::OpenLeg1: {
                 const std::string& tok = act.buy_yes ? act.market.yes_token_id : act.market.no_token_id;
                 double shares = act.shares;
                 double px = act.price;
-                if (store.paper_depth_sim()) {
-                    const auto wf = store.walk_ask_fill(tok, act.shares);
-                    if (wf.shares <= 0.0 || wf.cost_usdc + 1e-6 < kLihMinUsdc) {
-                        if (store.paper_realism_enabled()) {
-                            spdlog::info("[PAPER REALISM] LEG1 miss {} | depth/partial fill",
-                                         act.market.asset);
-                            store.push_telemetry(fmt::format(
-                                "[PAPER REALISM] LEG1 miss {} | depth/partial", act.market.asset));
-                        }
-                        return;
+                const auto wf = store.walk_ask_fill(tok, act.shares);
+                if (wf.shares <= 0.0 || wf.cost_usdc + 1e-6 < kLihMinUsdc) {
+                    if (store.paper_realism_enabled()) {
+                        spdlog::info("[PAPER REALISM] LEG1 miss {} | depth/partial fill",
+                                     act.market.asset);
+                        store.push_telemetry(fmt::format(
+                            "[PAPER REALISM] LEG1 miss {} | depth/partial", act.market.asset));
                     }
-                    shares = wf.shares;
-                    px = wf.avg_price;
-                    px = apply_paper_slippage(px, true, paper_action_extra_slip(store, act));
-                    spdlog::info("[LIH DEPTH] LEG1 {} {:.2f}/{:.2f}sh avg {:.4f} ({} lvls)",
-                                 act.market.asset, shares, act.shares, px, wf.levels_used);
-                } else {
-                    px = slip_buy(apply_paper_slippage(px, true, paper_action_extra_slip(store, act)));
+                    return;
                 }
+                shares = wf.shares;
+                px = wf.avg_price;
+                px = apply_paper_slippage(px, true, paper_action_extra_slip(store, act));
+                spdlog::info("[LIH DEPTH] LEG1 {} {:.2f}/{:.2f}sh avg {:.4f} ({} lvls)",
+                             act.market.asset, shares, act.shares, px, wf.levels_used);
                 const double cost = shares * px;
                 if (!risk_manager.can_open_lih_leg(
                         cost, false, nullptr, 0.0, &act.market.asset, act.market.window_minutes).first) {
@@ -1320,6 +1951,23 @@ int main() {
                 }
                 risk_manager.register_lih_open_leg1(act.market, act.buy_yes, px, shares, now_sec);
                 store.push_signal(fmt::format("LIH LEG1 {} {} {:.2f}sh @ {:.4f} ({})",
+                    act.market.asset, act.buy_yes ? "YES" : "NO", shares, px, act.note));
+                break;
+            }
+            case LegInAction::Kind::AddLeg1: {
+                const std::string& tok = act.buy_yes ? act.market.yes_token_id : act.market.no_token_id;
+                double shares = act.shares;
+                double px = act.price;
+                const auto wf = store.walk_ask_fill(tok, act.shares);
+                if (wf.shares <= 0.0 || wf.cost_usdc + 1e-6 < kLihMinUsdc) return;
+                shares = wf.shares;
+                px = wf.avg_price;
+                px = apply_paper_slippage(px, true, paper_action_extra_slip(store, act));
+                const double cost = shares * px;
+                if (!risk_manager.can_open_lih_leg(cost, true, &act.lih_id, shares).first) return;
+                if (!risk_manager.try_begin_lih_rebalance(act.lih_id)) return;
+                risk_manager.register_lih_add_leg(act.lih_id, act.buy_yes, px, shares, true, true);
+                store.push_signal(fmt::format("LIH CLIP {} {} +{:.2f}sh @ {:.4f} ({})",
                     act.market.asset, act.buy_yes ? "YES" : "NO", shares, px, act.note));
                 break;
             }
@@ -1335,31 +1983,42 @@ int main() {
                 }
                 double shares = act.shares;
                 double px = act.price;
-                if (store.paper_depth_sim()) {
-                    const auto wf = store.walk_ask_fill(tok, act.shares);
-                    if (wf.shares <= 0.0 || wf.cost_usdc + 1e-6 < kLihMinUsdc) {
-                        if (store.paper_realism_enabled()) {
-                            spdlog::info("[PAPER REALISM] HEDGE miss {} | partial {:.2f}/{:.2f}sh",
-                                         act.market.asset, wf.shares, act.shares);
-                            store.push_telemetry(fmt::format(
-                                "[PAPER REALISM] HEDGE miss {} | partial {:.2f}/{:.2f}sh",
-                                act.market.asset, wf.shares, act.shares));
-                        }
-                        return;
+                const auto wf = store.walk_ask_fill(tok, act.shares);
+                if (wf.shares <= 0.0 || wf.cost_usdc + 1e-6 < kLihMinUsdc) {
+                    if (store.paper_realism_enabled()) {
+                        spdlog::info("[PAPER REALISM] HEDGE miss {} | partial {:.2f}/{:.2f}sh",
+                                     act.market.asset, wf.shares, act.shares);
+                        store.push_telemetry(fmt::format(
+                            "[PAPER REALISM] HEDGE miss {} | partial {:.2f}/{:.2f}sh",
+                            act.market.asset, wf.shares, act.shares));
                     }
-                    shares = wf.shares;
-                    px = wf.avg_price;
-                    px = apply_paper_slippage(px, true, paper_action_extra_slip(store, act));
-                    spdlog::info("[LIH DEPTH] HEDGE {} {:.2f}/{:.2f}sh avg {:.4f} ({} lvls)",
-                                 act.market.asset, shares, act.shares, px, wf.levels_used);
-                } else {
-                    px = slip_buy(apply_paper_slippage(px, true, paper_action_extra_slip(store, act)));
+                    return;
                 }
+                shares = wf.shares;
+                px = wf.avg_price;
+                px = apply_paper_slippage(px, true, paper_action_extra_slip(store, act));
+                spdlog::info("[LIH DEPTH] HEDGE {} {:.2f}/{:.2f}sh avg {:.4f} ({} lvls)",
+                             act.market.asset, shares, act.shares, px, wf.levels_used);
                 const double cost = shares * px;
                 if (!risk_manager.can_open_lih_leg(cost, true, &act.lih_id, shares).first) return;
                 if (!risk_manager.try_begin_lih_rebalance(act.lih_id)) return;
                 risk_manager.register_lih_add_leg(act.lih_id, act.buy_yes, px, shares);
                 store.push_signal(fmt::format("LIH HEDGE {} {} {:.2f}sh @ {:.4f} ({})",
+                    act.market.asset, act.buy_yes ? "YES" : "NO", shares, px, act.note));
+                break;
+            }
+            case LegInAction::Kind::UnwindLeg1: {
+                double shares = act.shares;
+                double px = act.price;
+                px = slip_sell(apply_paper_slippage(px, false, paper_action_extra_slip(store, act)), act);
+                if (px <= 0.0) return;
+                if (!risk_manager.try_begin_lih_rebalance(act.lih_id)) return;
+                if (!risk_manager.register_lih_unwind(
+                        act.lih_id, act.buy_yes, px, shares, true, true)) {
+                    risk_manager.end_lih_rebalance_inflight(act.lih_id);
+                    return;
+                }
+                store.push_signal(fmt::format("LIH UNWIND {} sell {} {:.2f}sh @ {:.4f} ({})",
                     act.market.asset, act.buy_yes ? "YES" : "NO", shares, px, act.note));
                 break;
             }
@@ -1373,6 +2032,9 @@ int main() {
             const double now_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             const double now_sec = now_ms / 1000.0;
+            if (shadow_window_recorder) {
+                shadow_window_recorder->flush_expired(now_sec);
+            }
             if (auto act = lih_detector->evaluate(now_ms, risk_manager)) {
                 execute_lih_action(*act, now_sec);
             }
@@ -1386,7 +2048,12 @@ int main() {
         });
 
         // --- Q. 启动行情 Feed（回调注册完成后再 start，避免竞态）---
-        // Start feeds only after all callbacks are ready
+        if (chainlink_feed) {
+            chainlink_feed->set_tick_callback([&](const std::string& /*asset*/, double /*px*/) {
+                try_lih_evaluate();
+            });
+            chainlink_feed->start();
+        }
         if (binance_feed_enabled) {
             btc_feed->start();
             eth_feed->start();
@@ -1396,6 +2063,8 @@ int main() {
 
         std::atomic<bool> is_refreshing{false};
         std::vector<std::string> rest_poll_tokens;
+        const double process_boot_sec = std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
 
         // --- R. 市场刷新：Gamma 拉 5m/15m Up-Down 列表 → 重建检测器 → 订阅 token ---
         auto refresh_markets = [&]() {
@@ -1432,14 +2101,148 @@ int main() {
                         lih_flex_rebalance, lih_flex_dilute_ratio,
                         lih_leg1_trend_align, lih_trend_lookback_sec,
                         lih_leg1_trend_mode, lih_leg1_trend_max,
-                        lih_leg1_trigger_mode, lih_leg1_trigger_min,
+                        lih_leg1_trigger_mode, lih_leg1_trigger_min, lih_leg1_trigger_max,
                         lih_endgame_secs, lih_endgame_hold_ask, lih_endgame_resume_hedge_ask,
                         lih_endgame_soft_cap, lih_endgame_step_small, lih_endgame_step_large,
                         lih_endgame_gap_large, lih_endgame_override_secs,
                         lih_endgame_override_cooldown, lih_endgame_minimize_gap,
                         lih_endgame_ladder_enabled, lih_endgame_ladder_secs,
                         lih_endgame_ladder_start, lih_endgame_ladder_end,
-                        lih_endgame_ladder_step, lih_max_entry_marginal);
+                        lih_endgame_ladder_step, lih_max_entry_marginal,
+                        lih_mid_soft_cap, lih_mid_soft_start_secs,
+                        lih_hedge_feasible_entry, lih_hedge_feasible_cap);
+                    lih_detector->set_vwap_entry_gate(lih_vwap_entry_gate);
+                    lih_detector->set_vwap_entry_cap(lih_vwap_entry_cap);
+                    lih_detector->set_vwap_depth_ratio(lih_vwap_depth_ratio);
+                    lih_detector->set_min_edge_usdc(lih_min_edge_usdc);
+                    lih_detector->set_min_edge_per_share(lih_min_edge_per_share);
+                    lih_detector->set_leg1_shares(lih_leg1_shares);
+                    lih_detector->set_leg1_clip_shares(lih_leg1_clip_shares);
+                    lih_detector->set_unwind_enabled(lih_unwind_enabled);
+                    lih_detector->set_unwind_secs(lih_unwind_secs);
+                    lih_detector->set_unwind_cooldown(lih_unwind_cooldown);
+                    lih_detector->set_parallel_clip_hedge(lih_parallel_clip_hedge);
+                    lih_detector->set_parallel_hedge_max_combined(lih_parallel_hedge_max_combined);
+                    lih_detector->set_early_hedge_max_combined(lih_early_hedge_max_combined);
+                    lih_detector->set_open_gap_mode(lih_open_gap);
+                    lih_detector->set_heavy_clip_shares(lih_heavy_clip_shares);
+                    lih_detector->set_heavy_max_price(lih_heavy_max_price);
+                    lih_detector->set_max_gap_shares(lih_max_gap_shares);
+                    lih_detector->set_gap_hedge_max_combined(lih_gap_hedge_max_combined);
+                    lih_detector->set_hedge_min_gap_trigger(lih_hedge_min_gap_trigger);
+                    lih_detector->set_hedge_target_min_gap(lih_hedge_target_min_gap);
+                    lih_detector->set_mm2_mode(lih_mm2_mode);
+                    lih_detector->set_mm2_min_spot_bps(lih_mm2_min_spot_bps);
+                    lih_detector->set_mm2_entry_max_secs_left(lih_mm2_entry_max_secs_left);
+                    lih_detector->set_mm2_entry_min_secs_left(lih_mm2_entry_min_secs_left);
+                    lih_detector->set_mm2_favorite_min_px(lih_mm2_favorite_min);
+                    lih_detector->set_mm2_soft_spot_bps(lih_mm2_soft_spot_bps);
+                    lih_detector->set_mm2_late_tilt_min_ask(lih_mm2_late_tilt_min_ask);
+                    lih_detector->set_mm2_late_tilt_min_spread(lih_mm2_late_tilt_min_spread);
+                    lih_detector->set_mm2_heavy_delay_sec(lih_mm2_heavy_delay_sec);
+                    lih_detector->set_mm2_scale_clip_shares(lih_mm2_scale_clip);
+                    lih_detector->set_mm2_heavy_max_shares(lih_mm2_heavy_max_shares);
+                    lih_detector->set_mm2_scale_boost(lih_mm2_scale_boost);
+                    lih_detector->set_mm2_scale_against_stop_bps(lih_mm2_scale_against_stop_bps);
+                    lih_detector->set_mm2_hf1e_latch_gap(lih_mm2_hf1e_latch_gap);
+                    lih_detector->set_mm2_hf1e_latch_secs_left(lih_mm2_hf1e_latch_secs_left);
+                    lih_detector->set_mm2_hedge_boost(lih_mm2_hedge_boost);
+                    lih_detector->set_mm2_early_entry_max_secs_left(lih_mm2_early_entry_max);
+                    lih_detector->set_mm2_early_tilt_min_spread(lih_mm2_early_tilt_spread);
+                    lih_detector->set_mm2_early_tilt_min_fav(lih_mm2_early_tilt_fav);
+                    lih_detector->set_mm2_early_yes_guard(lih_mm2_early_yes_guard);
+                    // Re-read secondary gates from .env on every market refresh so a
+                    // mid-run .env patch (or incomplete first boot) cannot leave defaults.
+                    // Use env_int (no throw) — a bad MAIN_BJ_* must not abort the refresh.
+                    try {
+                        const auto env_now = load_env(".env");
+                        lih_mm2_main_bj_start =
+                            env_int(env_now, "LIH_MM2_MAIN_BJ_START", 8, 0, 23);
+                        lih_mm2_main_bj_end =
+                            env_int(env_now, "LIH_MM2_MAIN_BJ_END", 17, 0, 24);
+                        lih_mm2_offhours_min_ask =
+                            env_double_or(env_now, "LIH_MM2_OFFHOURS_MIN_ASK", 0.0);
+                        lih_mm2_min_side_depth =
+                            env_double_or(env_now, "LIH_MM2_MIN_SIDE_DEPTH", 0.0);
+                        lih_mm2_min_side_depth_main_only =
+                            env_flag_true(env_now, "LIH_MM2_MIN_SIDE_DEPTH_MAIN_ONLY", true);
+                    } catch (const std::exception& e) {
+                        spdlog::warn("secondary gate env re-read failed: {}", e.what());
+                    }
+                    lih_detector->set_mm2_main_bj_hours(lih_mm2_main_bj_start, lih_mm2_main_bj_end);
+                    lih_detector->set_mm2_offhours_min_ask(lih_mm2_offhours_min_ask);
+                    lih_detector->set_mm2_min_side_depth(lih_mm2_min_side_depth);
+                    lih_detector->set_mm2_min_side_depth_main_only(lih_mm2_min_side_depth_main_only);
+                    store.set_mm2_secondary_gates(
+                        lih_mm2_main_bj_start, lih_mm2_main_bj_end, lih_mm2_offhours_min_ask);
+                    {
+                        const auto gate_line = fmt::format(
+                            "CONFIG SECONDARY main_bj=[{},{}) offhours_min_ask={:.4f} "
+                            "min_side_depth={:.1f} depth_main_only={}",
+                            lih_mm2_main_bj_start, lih_mm2_main_bj_end,
+                            lih_mm2_offhours_min_ask, lih_mm2_min_side_depth,
+                            lih_mm2_min_side_depth_main_only ? "true" : "false");
+                        spdlog::info("LIH secondary gates | {}", gate_line);
+                        store.push_telemetry(gate_line);
+                        // Durable proof (telemetry ring is only 100 lines; bridge.log
+                        // only persists LIVE LIH SHADOW from telemetry).
+                        try {
+                            std::ofstream gate_f("logs/secondary_gates.last",
+                                                 std::ios::out | std::ios::trunc);
+                            if (gate_f) gate_f << gate_line << '\n';
+                        } catch (...) {
+                        }
+                    }
+                    lih_detector->set_mm2_spot_leg1_max_usdc(lih_mm2_spot_leg1_max_usdc);
+                    lih_detector->set_mm2_spot_heavy_max_usdc(lih_mm2_spot_heavy_max_usdc);
+                    lih_detector->set_mm2_session_utc_hours(
+                        lih_mm2_session_utc_start, lih_mm2_session_utc_end);
+                    lih_detector->set_mm2_skip_flat(lih_mm2_skip_flat);
+                    lih_detector->set_mm2_flat_max_spot_bps(lih_mm2_flat_max_spot_bps);
+                    lih_detector->set_mm2_flat_max_ask_sum(lih_mm2_flat_max_ask_sum);
+                    lih_detector->set_mm2_vol_gate(lih_mm2_vol_gate);
+                    lih_detector->set_mm2_vol_min_spot_bps(lih_mm2_vol_min_spot_bps);
+                    lih_detector->set_mm2_vol_max_spot_bps(lih_mm2_vol_max_spot_bps);
+                    lih_detector->set_mm2_vol_max_spot_std(lih_mm2_vol_max_spot_std);
+                    lih_detector->set_mm2_v2j_adaptive(lih_mm2_v2j_adaptive);
+                    lih_detector->set_mm2_v2j_mom_lookback_sec(lih_mm2_v2j_mom_lookback);
+                    lih_detector->set_mm2_v2j_mom_fav_max_ask(lih_mm2_v2j_mom_fav_max);
+                    lih_detector->set_mm2_v2j_spread_min(lih_mm2_v2j_spread_min);
+                    lih_detector->set_mm2_v2j_spread_fav_max_ask(lih_mm2_v2j_spread_fav_max);
+                    lih_detector->set_mm2_tilt_entry(lih_mm2_tilt_entry);
+                    lih_detector->set_mm2_tilt_delta(lih_mm2_tilt_delta);
+                    lih_detector->set_mm2_tilt_side_follow(lih_mm2_tilt_side_follow);
+                    lih_detector->set_mm2_cheaper_later(lih_mm2_cheaper_later);
+                    lih_detector->set_mm2_fav_early_bypass(lih_mm2_fav_early_bypass);
+                    lih_detector->set_mm2_fav_early_mode(lih_mm2_fav_early_mode);
+                    lih_detector->set_mm2_fav_early_fav_lo(lih_mm2_fav_early_fav_lo);
+                    lih_detector->set_mm2_fav_early_fav_hi(lih_mm2_fav_early_fav_hi);
+                    lih_detector->set_mm2_fav_early_min_spread(lih_mm2_fav_early_min_spread);
+                    lih_detector->set_mm2_fav_early_min_dtilt(lih_mm2_fav_early_min_dtilt);
+                    lih_detector->set_mm2_obs_skip_from_pack(lih_mm2_obs_skip_from_pack);
+                    lih_detector->set_mm2_replay_leg1(lih_mm2_replay_leg1);
+                    lih_detector->set_mm2_replay_lag_tol_sec(lih_mm2_replay_lag_tol);
+                    if (lih_mm2_session_from_obs && lih_mm2_mode) {
+                        if (!lih_detector->load_mm2_session_from_pack(lih_mm2_obs_m2_root)) {
+                            lih_detector->load_mm2_session_file(lih_mm2_session_file);
+                        }
+                    } else if (lih_mm2_mode && lih_mm2_session_explicit) {
+                        lih_detector->load_mm2_session_file(lih_mm2_session_file);
+                    }
+                    if (lih_mm2_obs_skip_from_pack && lih_mm2_mode) {
+                        lih_detector->load_mm2_obs_skip_pack(lih_mm2_obs_m2_root);
+                    }
+                    if (lih_mm2_replay_leg1 && lih_mm2_mode) {
+                        lih_detector->load_mm2_replay_leg1_pack(lih_mm2_obs_m2_root);
+                    }
+                    lih_detector->set_skip_partial_window_on_start(lih_skip_partial_window);
+                    lih_detector->set_process_boot_sec(process_boot_sec);
+                    if (shadow_window_recorder) {
+                        lih_detector->set_shadow_window_recorder(shadow_window_recorder.get());
+                    }
+                    if (regime_gate) {
+                        lih_detector->set_regime_gate(regime_gate.get());
+                    }
                     risk_manager.sync_lih_from_markets(all_m);
                 }
                 std::vector<std::string> tokens;
@@ -1460,11 +2263,14 @@ int main() {
         refresh_markets();
         std::this_thread::sleep_for(std::chrono::seconds(3));
         auto last_market_refresh = std::chrono::system_clock::now();
+        auto last_session_refresh = std::chrono::system_clock::now();
+        const int session_refresh_sec =
+            (lih_mm2_session_from_obs || lih_mm2_obs_skip_from_pack || lih_mm2_replay_leg1) ? 60 : 0;
         
         // --- S. 后台线程：实盘余额同步（fetch_balance.py，间隔 WALLET_SYNC_INTERVAL_SEC）---
-        std::thread balance_thread([&, wallet_sync_interval_sec]() {
+        std::thread balance_thread([&, wallet_sync_interval_sec, shadow_virtual_bankroll]() {
             while (true) {
-                if (!paper_mode) {
+                if (!paper_mode && !shadow_virtual_bankroll) {
                     const std::string bal_out = popen_read_first_line(
                         python_script_cmd("fetch_balance.py", "", false));
                     if (!bal_out.empty()) {
@@ -1513,9 +2319,9 @@ int main() {
             auto loop_start = std::chrono::system_clock::now();
             const bool poll_rest_book = book_aware_detect || paper_official_book;
             if (poll_rest_book &&
-                // ~2.5s REST book poll (DH book-aware)
                 !rest_book_refreshing.load(std::memory_order_acquire) &&
-                loop_start - last_rest_book_poll > std::chrono::milliseconds(2500)) {
+                loop_start - last_rest_book_poll >
+                    std::chrono::milliseconds(store.lih_quote_rest_only() ? 2000 : 2500)) {
                 last_rest_book_poll = loop_start;
                 std::vector<std::string> tokens_copy;
                 {
@@ -1534,6 +2340,24 @@ int main() {
                 // 定期刷新 Up-Down 市场列表与 token 订阅（GAMMA_MARKET_REFRESH_SEC）
                 last_market_refresh = loop_start;
                 std::thread([&refresh_markets]() { refresh_markets(); }).detach();
+            }
+            if (session_refresh_sec > 0 && lih_detector
+                && loop_start - last_session_refresh > std::chrono::seconds(session_refresh_sec)) {
+                last_session_refresh = loop_start;
+                std::lock_guard<std::mutex> lock(detector_mutex);
+                if (lih_detector) {
+                    if (lih_mm2_session_from_obs) {
+                        if (!lih_detector->load_mm2_session_from_pack(lih_mm2_obs_m2_root)) {
+                            lih_detector->load_mm2_session_file(lih_mm2_session_file);
+                        }
+                    }
+                    if (lih_mm2_obs_skip_from_pack) {
+                        lih_detector->load_mm2_obs_skip_pack(lih_mm2_obs_m2_root);
+                    }
+                    if (lih_mm2_replay_leg1) {
+                        lih_detector->load_mm2_replay_leg1_pack(lih_mm2_obs_m2_root);
+                    }
+                }
             }
             // REST fallback when Binance WS is blocked (common in Docker/region)
             if (binance_feed_enabled && loop_start - last_binance_rest > std::chrono::seconds(2)) {
@@ -1577,7 +2401,16 @@ int main() {
                 last_live_save = loop_start;
                 persistence::save_live_lih_state(risk_manager, live_state_path, false);
             }
-            std::cout << store.get_dashboard_json() << std::endl; // → dashboard_bridge stdout
+            try {
+                auto dj = boost::json::parse(store.get_dashboard_json());
+                if (dj.is_object() && regime_gate) {
+                    regime_gate->append_dashboard(dj.as_object());
+                }
+                std::cout << boost::json::serialize(dj) << std::endl;
+            } catch (const std::exception& e) {
+                spdlog::warn("dashboard json merge failed: {}", e.what());
+                std::cout << store.get_dashboard_json() << std::endl;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
 

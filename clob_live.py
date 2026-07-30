@@ -25,7 +25,80 @@ load_dotenv()
 
 _SCALE = 1_000_000.0
 _MIN_BUY_USDC = 1.0
+_MIN_ORDER_SHARES = 5.0
 _ORDER_ID_RE = re.compile(r"0x[a-fA-F0-9]{64}")
+_TICK = 0.01
+
+
+def classify_exec(
+    *,
+    side: str,
+    price: float,
+    side_ask: float | None,
+    side_bid: float | None = None,
+    secs_left: float | None = None,
+) -> str:
+    """Infer exec_class from fill price vs book (mm2-tracker-v2 rules)."""
+    px = float(price)
+    if side_ask is None:
+        if secs_left is not None and secs_left <= 20:
+            return "endgame_no_book"
+        if px >= 0.92 or px <= 0.08:
+            return "endgame_no_book"
+        return "no_book"
+    ask = float(side_ask)
+    if side.upper() == "BUY":
+        if px < ask - _TICK:
+            return "limit_below_ask"
+        if side_bid is not None and px <= float(side_bid) + _TICK:
+            return "limit_at_bid"
+        if px <= ask + _TICK:
+            return "taker_at_ask"
+        return "taker_above_ask"
+    return "unknown"
+
+
+def infer_trader_side(post_order_type: str, exec_class: str) -> str:
+    if post_order_type.upper() == "FAK":
+        return "TAKER"
+    if exec_class in ("limit_below_ask", "limit_at_bid"):
+        return "MAKER"
+    if exec_class in ("taker_at_ask", "taker_above_ask"):
+        return "TAKER"
+    return ""
+
+
+def _attach_exec_meta(
+    result: dict[str, Any],
+    *,
+    side: str,
+    fill_price: float,
+    post_order_type: str,
+    side_ask: float | None = None,
+    side_bid: float | None = None,
+    secs_left: float | None = None,
+    intent: str = "",
+) -> dict[str, Any]:
+    result["post_order_type"] = post_order_type
+    if intent:
+        result["intent"] = intent
+    if side_ask is not None:
+        result["side_ask_at_fill"] = side_ask
+        result["price_vs_ask_cents"] = round((float(fill_price) - float(side_ask)) * 100.0, 4)
+    if side_bid is not None:
+        result["side_bid_at_fill"] = side_bid
+    ec = classify_exec(
+        side=side,
+        price=fill_price,
+        side_ask=side_ask,
+        side_bid=side_bid,
+        secs_left=secs_left,
+    )
+    result["exec_class"] = ec
+    ts = infer_trader_side(post_order_type, ec)
+    if ts:
+        result["trader_side"] = ts
+    return result
 
 
 def _resolve_signature_type(funder: str, signer: str) -> int:
@@ -72,6 +145,8 @@ def buy_usdc_for_shares(price: float, size_shares: float) -> tuple[float, float,
     if price <= 0 or size_shares <= 0:
         return price, 0.0, 0.0
     size_2dp = math.floor(float(size_shares) * 100 + 1e-9) / 100
+    if size_2dp + 1e-9 < _MIN_ORDER_SHARES:
+        return price, 0.0, 0.0
     usdc = math.floor(price * size_2dp * 100 + 1e-9) / 100
     if usdc < _MIN_BUY_USDC:
         size_2dp = math.ceil((_MIN_BUY_USDC / price) * 100) / 100
@@ -238,6 +313,10 @@ def _normalize_result(
     client: ClobClient,
     token_id: str = "",
     submit_ts: float | None = None,
+    post_order_type: str = "FAK",
+    side_ask: float | None = None,
+    side_bid: float | None = None,
+    intent: str = "",
 ) -> dict[str, Any]:
     if not order_id and resp:
         order_id = _extract_order_id(resp)
@@ -281,16 +360,27 @@ def _normalize_result(
             "size_shares": 0.0,
             "order_id": order_id,
             "status": status,
+            "post_order_type": post_order_type,
         }
 
-    return {
+    out_price = fill_price if fill_price > 0 else fallback_price
+    result = {
         "success": True,
-        "price": fill_price if fill_price > 0 else fallback_price,
+        "price": out_price,
         "size_shares": fill_shares,
         "order_id": order_id,
         "status": status or "matched",
         "error": "",
     }
+    return _attach_exec_meta(
+        result,
+        side=side,
+        fill_price=out_price,
+        post_order_type=post_order_type,
+        side_ask=side_ask,
+        side_bid=side_bid,
+        intent=intent,
+    )
 
 
 def resolve_order_fill(
@@ -355,6 +445,9 @@ def post_fak_order(
     side: str,
     *,
     neg_risk: bool = False,
+    side_ask: float | None = None,
+    side_bid: float | None = None,
+    intent: str = "",
 ) -> dict[str, Any]:
     """Submit a FAK limit order; returns normalized result dict for C++ bridge."""
     side_u = side.upper()
@@ -417,10 +510,19 @@ def post_fak_order(
                     client=client,
                     token_id=str(token_id),
                     submit_ts=submit_ts,
+                    post_order_type="FAK",
+                    side_ask=side_ask,
+                    side_bid=side_bid,
+                    intent=intent,
                 )
             except Exception:
                 pass
-        return {"success": False, "error": str(exc), "order_id": order_id}
+        return {
+            "success": False,
+            "error": str(exc),
+            "order_id": order_id,
+            "post_order_type": "FAK",
+        }
 
     if not isinstance(resp, dict):
         return {"success": False, "error": f"unexpected response type: {type(resp).__name__}"}
@@ -440,8 +542,18 @@ def post_fak_order(
                 client=_client(),
                 token_id=str(token_id),
                 submit_ts=submit_ts,
+                post_order_type="FAK",
+                side_ask=side_ask,
+                side_bid=side_bid,
+                intent=intent,
             )
-        return {"success": False, "error": error_msg or "order rejected", "status": status, "order_id": order_id}
+        return {
+            "success": False,
+            "error": error_msg or "order rejected",
+            "status": status,
+            "order_id": order_id,
+            "post_order_type": "FAK",
+        }
 
     if status == "unmatched" and order_id:
         return _normalize_result(
@@ -452,9 +564,19 @@ def post_fak_order(
             client=_client(),
             token_id=str(token_id),
             submit_ts=submit_ts,
+            post_order_type="FAK",
+            side_ask=side_ask,
+            side_bid=side_bid,
+            intent=intent,
         )
     if status == "unmatched":
-        return {"success": False, "error": "FAK unmatched", "status": status, "order_id": order_id}
+        return {
+            "success": False,
+            "error": "FAK unmatched",
+            "status": status,
+            "order_id": order_id,
+            "post_order_type": "FAK",
+        }
 
     return _normalize_result(
         side=side_u,
@@ -464,4 +586,133 @@ def post_fak_order(
         client=_client(),
         token_id=str(token_id),
         submit_ts=submit_ts,
+        post_order_type="FAK",
+        side_ask=side_ask,
+        side_bid=side_bid,
+        intent=intent,
     )
+
+
+def post_gtc_order(
+    token_id: str,
+    price: float,
+    size_shares: float,
+    side: str,
+    *,
+    neg_risk: bool = False,
+    side_ask: float | None = None,
+    side_bid: float | None = None,
+    intent: str = "",
+    wait_secs: float = 8.0,
+) -> dict[str, Any]:
+    """Post GTC limit; poll until partial/full fill, cancel, or timeout."""
+    side_u = side.upper()
+    if side_u not in ("BUY", "SELL"):
+        return {"success": False, "error": f"invalid side: {side}", "post_order_type": "GTC"}
+    if side_u == "BUY":
+        price, usdc, size_shares = buy_usdc_for_shares(price, size_shares)
+    else:
+        price, size_shares = round_clob_sell(price, size_shares)
+        usdc = 0.0
+    if side_u == "BUY" and usdc <= 0:
+        return {"success": False, "error": "size below exchange minimum after rounding", "post_order_type": "GTC"}
+    if side_u == "SELL" and size_shares <= 0:
+        return {"success": False, "error": "size below exchange minimum after rounding", "post_order_type": "GTC"}
+
+    submit_ts = time.time()
+    try:
+        client = _client()
+        opts = PartialCreateOrderOptions(neg_risk=True) if neg_risk else None
+        args = OrderArgsV2(
+            token_id=str(token_id),
+            price=float(price),
+            size=float(size_shares),
+            side=side_u,
+        )
+        resp = client.create_and_post_order(args, options=opts, order_type=OrderType.GTC)
+    except Exception as exc:
+        order_id = _extract_order_id(getattr(exc, "error_message", None) or str(exc))
+        if order_id:
+            try:
+                return _normalize_result(
+                    side=side_u,
+                    fallback_price=price,
+                    resp=None,
+                    order_id=order_id,
+                    client=_client(),
+                    token_id=str(token_id),
+                    submit_ts=submit_ts,
+                    post_order_type="GTC",
+                    side_ask=side_ask,
+                    side_bid=side_bid,
+                    intent=intent,
+                )
+            except Exception:
+                pass
+        return {"success": False, "error": str(exc), "order_id": order_id, "post_order_type": "GTC"}
+
+    if not isinstance(resp, dict):
+        return {"success": False, "error": f"unexpected response type: {type(resp).__name__}", "post_order_type": "GTC"}
+
+    order_id = _extract_order_id(resp)
+    deadline = time.time() + max(0.5, float(wait_secs))
+    while time.time() < deadline:
+        time.sleep(0.35)
+        try:
+            od = client.get_order(order_id)
+        except Exception:
+            continue
+        if not isinstance(od, dict):
+            continue
+        st = str(od.get("status", "")).lower()
+        matched = float(od.get("size_matched", 0) or 0)
+        if matched > 0 or st in ("matched", "filled"):
+            return _normalize_result(
+                side=side_u,
+                fallback_price=price,
+                resp=od,
+                order_id=order_id,
+                client=client,
+                token_id=str(token_id),
+                submit_ts=submit_ts,
+                post_order_type="GTC",
+                side_ask=side_ask,
+                side_bid=side_bid,
+                intent=intent,
+            )
+        if st in ("cancelled", "canceled", "expired", "failed"):
+            break
+    try:
+        if order_id:
+            client.cancel(order_id)
+    except Exception:
+        pass
+    try:
+        od = client.get_order(order_id) if order_id else None
+    except Exception:
+        od = None
+    if isinstance(od, dict):
+        matched = float(od.get("size_matched", 0) or 0)
+        if matched > 0:
+            return _normalize_result(
+                side=side_u,
+                fallback_price=price,
+                resp=od,
+                order_id=order_id,
+                client=client,
+                token_id=str(token_id),
+                submit_ts=submit_ts,
+                post_order_type="GTC",
+                side_ask=side_ask,
+                side_bid=side_bid,
+                intent=intent,
+            )
+    return {
+        "success": False,
+        "error": "GTC timeout or 0 fill",
+        "price": price,
+        "size_shares": 0.0,
+        "order_id": order_id,
+        "status": "timeout",
+        "post_order_type": "GTC",
+    }
